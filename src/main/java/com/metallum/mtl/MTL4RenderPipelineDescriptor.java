@@ -40,6 +40,7 @@ public final class MTL4RenderPipelineDescriptor implements AutoCloseable {
             Msg.ofVoid("setInputPrimitiveTopology:", JAVA_LONG);
     private static final Msg SET_SUPPORT_ICB =
             Msg.ofVoid("setSupportIndirectCommandBuffers:", JAVA_LONG);
+    private static final Msg SET_LABEL = Msg.ofVoid("setLabel:", ADDRESS);
 
     private MemorySegment handle;
 
@@ -91,6 +92,15 @@ public final class MTL4RenderPipelineDescriptor implements AutoCloseable {
 
     public void setSupportIndirectCommandBuffers(final boolean enabled) {
         SET_SUPPORT_ICB.send(handle(), enabled ? 1L : 0L);
+    }
+
+    public void setLabel(final String label) {
+        MemorySegment value = ObjC.nsString(label);
+        try {
+            SET_LABEL.send(handle(), value);
+        } finally {
+            ObjC.release(value);
+        }
     }
 
     public void setBlendState(

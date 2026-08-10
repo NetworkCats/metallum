@@ -15,9 +15,13 @@ public final class MetalIndirectDrawBatch extends MultiDrawBatch {
     private final long[] firstIndices;
     private long revision;
     private long nativeRevision = -1L;
+    private MetalGpuBuffer nativeIndexOwner;
+    private long nativeIndexGeneration = -1L;
     private long nativeIndexBuffer;
     private int nativeSize = -1;
     private long failedRevision = -1L;
+    private MetalGpuBuffer failedIndexOwner;
+    private long failedIndexGeneration = -1L;
     private long failedIndexBuffer;
     private MTLIndirectCommandBuffer commands;
     private MetalDevice device;
@@ -56,18 +60,27 @@ public final class MetalIndirectDrawBatch extends MultiDrawBatch {
             final MTLRenderCommandEncoder encoder,
             final MTLPrimitiveType primitiveType,
             final MTLIndexType indexType,
-            final MTLBuffer indexBuffer
+            final MetalGpuBuffer indexBufferOwner
     ) {
         if (this.size <= 0 || primitiveType == MTLPrimitiveType.TriangleFan) {
             return false;
         }
+        MTLBuffer indexBuffer = indexBufferOwner.metalBuffer();
+        long generation = indexBufferOwner.backingGeneration();
         long backing = indexBuffer.handle().address();
-        if (needsRebuild(backing)) {
-            if (this.failedRevision == this.revision && this.failedIndexBuffer == backing) {
+        if (needsRebuild(indexBufferOwner, generation, backing)) {
+            if (this.failedRevision == this.revision
+                    && this.failedIndexOwner == indexBufferOwner
+                    && this.failedIndexGeneration == generation
+                    && this.failedIndexBuffer == backing) {
                 return false;
             }
-            if (!rebuild(device, primitiveType, indexType, indexBuffer, backing)) {
+            if (!rebuild(
+                    device, primitiveType, indexType,
+                    indexBufferOwner, indexBuffer, generation, backing)) {
                 this.failedRevision = this.revision;
+                this.failedIndexOwner = indexBufferOwner;
+                this.failedIndexGeneration = generation;
                 this.failedIndexBuffer = backing;
                 return false;
             }
@@ -88,9 +101,15 @@ public final class MetalIndirectDrawBatch extends MultiDrawBatch {
         }
     }
 
-    private boolean needsRebuild(final long backing) {
+    private boolean needsRebuild(
+            final MetalGpuBuffer indexBufferOwner,
+            final long generation,
+            final long backing
+    ) {
         return this.commands == null
                 || this.nativeRevision != this.revision
+                || this.nativeIndexOwner != indexBufferOwner
+                || this.nativeIndexGeneration != generation
                 || this.nativeIndexBuffer != backing
                 || this.nativeSize != this.size;
     }
@@ -99,7 +118,9 @@ public final class MetalIndirectDrawBatch extends MultiDrawBatch {
             final MetalDevice device,
             final MTLPrimitiveType primitiveType,
             final MTLIndexType indexType,
+            final MetalGpuBuffer indexBufferOwner,
             final MTLBuffer indexBuffer,
+            final long generation,
             final long backing
     ) {
         MTLIndirectCommandBuffer fresh = null;
@@ -121,9 +142,13 @@ public final class MetalIndirectDrawBatch extends MultiDrawBatch {
             this.commands = fresh;
             this.device = device;
             this.nativeRevision = this.revision;
+            this.nativeIndexOwner = indexBufferOwner;
+            this.nativeIndexGeneration = generation;
             this.nativeIndexBuffer = backing;
             this.nativeSize = this.size;
             this.failedRevision = -1L;
+            this.failedIndexOwner = null;
+            this.failedIndexGeneration = -1L;
             Stats.increment(Stats.Counter.NATIVE_RESOURCES_CREATED);
             return true;
         } catch (RuntimeException exception) {
@@ -145,6 +170,8 @@ public final class MetalIndirectDrawBatch extends MultiDrawBatch {
             this.commands.close();
         }
         this.commands = null;
+        this.nativeIndexOwner = null;
+        this.nativeIndexGeneration = -1L;
     }
 
     @Override

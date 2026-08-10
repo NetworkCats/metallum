@@ -29,6 +29,10 @@ public final class MTLRenderPipelineDescriptor implements AutoCloseable {
     private static final Msg SET_ALPHA_BLEND_OPERATION = Msg.ofVoid("setAlphaBlendOperation:", JAVA_LONG);
     private static final Msg SET_SUPPORT_ICB =
             Msg.ofVoid("setSupportIndirectCommandBuffers:", JAVA_BOOLEAN);
+    private static final Msg SET_LABEL = Msg.ofVoid("setLabel:", ADDRESS);
+    private static final MemorySegment NS_ARRAY = ObjC.findClass("NSArray");
+    private static final Msg ARRAY_WITH_OBJECT = Msg.of("arrayWithObject:", ADDRESS, ADDRESS);
+    private static final Msg SET_BINARY_ARCHIVES = Msg.ofVoid("setBinaryArchives:", ADDRESS);
 
     private final MemorySegment handle;
     private boolean closed;
@@ -52,6 +56,27 @@ public final class MTLRenderPipelineDescriptor implements AutoCloseable {
 
     public void setSupportIndirectCommandBuffers(final boolean enabled) {
         SET_SUPPORT_ICB.send(this.handle, enabled);
+    }
+
+    public void setLabel(final String label) {
+        MemorySegment value = ObjC.nsString(label);
+        try {
+            SET_LABEL.send(this.handle, value);
+        } finally {
+            ObjC.release(value);
+        }
+    }
+
+    public void setBinaryArchive(final MemorySegment archive) {
+        if (ObjC.isNil(archive)
+                || ObjC.isNil(NS_ARRAY)
+                || !ObjC.respondsToSelector(this.handle, "setBinaryArchives:")) {
+            return;
+        }
+        try (AutoreleasePool ignored = AutoreleasePool.push()) {
+            MemorySegment archives = ARRAY_WITH_OBJECT.sendPtr(NS_ARRAY, archive);
+            SET_BINARY_ARCHIVES.send(this.handle, archives);
+        }
     }
 
     public void setColorAttachmentFormat(final long index, final MTLPixelFormat format) {

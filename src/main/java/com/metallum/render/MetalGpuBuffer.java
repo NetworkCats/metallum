@@ -36,6 +36,7 @@ class MetalGpuBuffer extends GpuBuffer {
     private final Map<TexelViewKey, MemorySegment> texelViews = new HashMap<>();
     private long writableSubmit = -1L;
     private boolean backingUsedByGpu;
+    private final PendingBufferWrites pendingWrites = new PendingBufferWrites();
 
     MetalGpuBuffer(final MetalDevice device, @GpuBuffer.Usage final int usage, final long size) {
         super(usage, size);
@@ -105,6 +106,10 @@ class MetalGpuBuffer extends GpuBuffer {
         return this.allocationSize;
     }
 
+    long backingGeneration() {
+        return this.backingGeneration;
+    }
+
     long resourceOptions() {
         return this.resourceOptions;
     }
@@ -130,9 +135,23 @@ class MetalGpuBuffer extends GpuBuffer {
     }
 
     void markGpuUse(final long submitIndex) {
-        if (this.writableSubmit == submitIndex) {
-            this.backingUsedByGpu = true;
-        }
+        this.backingUsedByGpu = true;
+    }
+
+    void queueDynamicWrite(final long submitIndex, final long offset, final ByteBuffer source) {
+        this.pendingWrites.add(submitIndex, this.size(), offset, source);
+    }
+
+    boolean hasPendingWrites(final long submitIndex) {
+        return this.pendingWrites.hasWrites(submitIndex);
+    }
+
+    boolean pendingWritesCoverWholeBuffer() {
+        return this.pendingWrites.coversWholeBuffer(this.size());
+    }
+
+    void applyPendingWrites(final ByteBuffer destination) {
+        this.pendingWrites.applyTo(destination);
     }
 
     MemorySegment texelTextureView(
@@ -181,6 +200,7 @@ class MetalGpuBuffer extends GpuBuffer {
         this.closed = true;
         this.storage = null;
         this.backingUsedByGpu = true;
+        this.pendingWrites.clear();
         releaseTexelViews();
         if (this.nativeBuffer != null) {
             MemorySegment handle = this.nativeBuffer.handle();

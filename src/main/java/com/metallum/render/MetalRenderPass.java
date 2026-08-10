@@ -131,9 +131,7 @@ final class MetalRenderPass implements RenderPassBackend {
         if (textureView != null && sampler != null) {
             commandEncoder.flushPendingClear((MetalGpuTexture) textureView.texture());
             TextureViewAndSampler previous = samplers.get(name);
-            if (previous != null
-                    && previous.textureView() == textureView
-                    && previous.sampler() == sampler) {
+            if (sameTextureBinding(previous, textureView, sampler)) {
                 return;
             }
             TextureViewAndSampler binding = new TextureViewAndSampler(textureView, sampler);
@@ -249,7 +247,7 @@ final class MetalRenderPass implements RenderPassBackend {
         MTLRenderCommandEncoder enc = renderEncoder();
         bindDrawState(enc);
         trackIndexBuffer(nativeIndexBuffer);
-        if (!batch.execute(this.device, enc, primitiveTopology(), this.indexType, nativeIndexBuffer.metalBuffer())) {
+        if (!batch.execute(this.device, enc, primitiveTopology(), this.indexType, nativeIndexBuffer)) {
             batch.drawFallback(this);
         }
     }
@@ -504,6 +502,7 @@ final class MetalRenderPass implements RenderPassBackend {
     }
 
     private MTLRenderCommandEncoder renderEncoder() {
+        materializeDynamicUniforms();
         MetalGpuTextureView colorTextureView = (MetalGpuTextureView) colorTexture;
         MetalGpuTextureView depthTextureView = depthTexture == null ? null : (MetalGpuTextureView) depthTexture;
         MTLRenderCommandEncoder encoder = commandEncoder.renderCommandEncoder(
@@ -517,6 +516,21 @@ final class MetalRenderPass implements RenderPassBackend {
         clearColor = null;
         clearDepth = null;
         return encoder;
+    }
+
+    private void materializeDynamicUniforms() {
+        for (int slot = 0; slot < this.descriptorBuffers.length; slot++) {
+            GpuBufferSlice slice = this.descriptorBuffers[slot];
+            if (slice == null || !(slice.buffer() instanceof MetalGpuBuffer buffer) || !buffer.isDynamic()) {
+                continue;
+            }
+            if (this.commandEncoder.materializeDynamicWrites(buffer)) {
+                this.dirtyDescriptorMask |= 1L << slot;
+                this.uniformBackings.put(
+                        this.compiledPipeline.resources().get(slot).name(),
+                        buffer.nativeHandle().address());
+            }
+        }
     }
 
     void invalidateEncoderState() {
@@ -605,7 +619,13 @@ final class MetalRenderPass implements RenderPassBackend {
                 }
             }
             GpuBufferSlice slice = mapped.slice();
-            encoder.drawIndexedPrimitives(MTLPrimitiveType.Triangle, indexCount, fanIndexType, ((MetalGpuBuffer) slice.buffer()).metalBuffer(), slice.offset(), instanceCount, firstVertex, baseInstance);
+            MetalGpuBuffer generated = (MetalGpuBuffer) slice.buffer();
+            commandEncoder.bufferAccess(
+                    generated.metalBuffer(), slice.offset(), slice.length(),
+                    ResourceAccessTracker.Access.READ, MetalCommandEncoder.STAGE_VERTEX);
+            encoder.drawIndexedPrimitives(
+                    MTLPrimitiveType.Triangle, indexCount, fanIndexType,
+                    generated.metalBuffer(), slice.offset(), instanceCount, firstVertex, baseInstance);
         }
     }
 
@@ -633,7 +653,13 @@ final class MetalRenderPass implements RenderPassBackend {
             try (GpuBufferSlice.MappedView mapped = commandEncoder.transientMemory().allocateGpuMapped((long) generatedIndexCount * Integer.BYTES, Integer.BYTES, GpuBuffer.USAGE_INDEX)) {
                 expandTriangleFan(mapped.data().asIntBuffer(), nativeIndexBuffer.metalBuffer(), indexOffsetBytes, indexCount, indexType);
                 GpuBufferSlice slice = mapped.slice();
-                enc.drawIndexedPrimitives(MTLPrimitiveType.Triangle, generatedIndexCount, MTLIndexType.UInt32, ((MetalGpuBuffer) slice.buffer()).metalBuffer(), slice.offset(), instanceCount, baseVertex, baseInstance);
+                MetalGpuBuffer generated = (MetalGpuBuffer) slice.buffer();
+                commandEncoder.bufferAccess(
+                        generated.metalBuffer(), slice.offset(), slice.length(),
+                        ResourceAccessTracker.Access.READ, MetalCommandEncoder.STAGE_VERTEX);
+                enc.drawIndexedPrimitives(
+                        MTLPrimitiveType.Triangle, generatedIndexCount, MTLIndexType.UInt32,
+                        generated.metalBuffer(), slice.offset(), instanceCount, baseVertex, baseInstance);
             }
         } else {
             trackIndexBuffer(nativeIndexBuffer);
@@ -946,5 +972,26 @@ final class MetalRenderPass implements RenderPassBackend {
         return left.buffer() == right.buffer()
                 && left.offset() == right.offset()
                 && left.length() == right.length();
+    }
+
+    private static boolean sameTextureBinding(
+            @Nullable final TextureViewAndSampler previous,
+            final GpuTextureView textureView,
+            final GpuSampler sampler
+    ) {
+        if (previous == null) {
+            return false;
+        }
+        if (previous.textureView() == textureView && previous.sampler() == sampler) {
+            return true;
+        }
+        if (!(previous.textureView() instanceof MetalGpuTextureView oldView)
+                || !(textureView instanceof MetalGpuTextureView newView)
+                || !(previous.sampler() instanceof MetalGpuSampler oldSampler)
+                || !(sampler instanceof MetalGpuSampler newSampler)) {
+            return false;
+        }
+        return oldView.nativeHandle().address() == newView.nativeHandle().address()
+                && oldSampler.nativeHandle().address() == newSampler.nativeHandle().address();
     }
 }

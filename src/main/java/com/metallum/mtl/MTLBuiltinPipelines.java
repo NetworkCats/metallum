@@ -12,6 +12,7 @@ import org.lwjgl.system.MemoryStack;
 import java.lang.foreign.MemorySegment;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.function.Consumer;
 
 import static java.lang.foreign.ValueLayout.JAVA_FLOAT;
 
@@ -97,6 +98,8 @@ public final class MTLBuiltinPipelines {
     private static MTLResidencySet residencySet;
     @Nullable
     private static MTL4Compiler metal4Compiler;
+    @Nullable
+    private static MTLBinaryArchive metal3Archive;
     private static MemorySegment presentPipeline = MemorySegment.NULL;
     private static MemorySegment presentLinearSampler = MemorySegment.NULL;
     private static MemorySegment presentNearestSampler = MemorySegment.NULL;
@@ -111,11 +114,13 @@ public final class MTLBuiltinPipelines {
     public static void init(
             final MTLDevice mtlDevice,
             @Nullable final MTLResidencySet liveResidencySet,
-            @Nullable final MTL4Compiler compiler
+            @Nullable final MTL4Compiler compiler,
+            @Nullable final MTLBinaryArchive binaryArchive
     ) {
         device = mtlDevice;
         residencySet = liveResidencySet;
         metal4Compiler = compiler;
+        metal3Archive = binaryArchive;
         presentPipeline = buildPipeline(PRESENT_MSL, "metallum_present_vs", "metallum_present_fs",
                 MTLPixelFormat.BGRA8Unorm.value, MTLPixelFormat.Invalid.value, MTLColorWriteMask.All.value);
         presentLinearSampler = buildPresentSampler(MTLSamplerMinMagFilter.Linear);
@@ -151,6 +156,7 @@ public final class MTLBuiltinPipelines {
         }
         residencySet = null;
         metal4Compiler = null;
+        metal3Archive = null;
         device = null;
     }
 
@@ -206,7 +212,9 @@ public final class MTLBuiltinPipelines {
             final int y,
             final int width,
             final int height,
-            final MTLFence globalFence
+            final MTLFence globalFence,
+            @Nullable final Consumer<MTLRenderCommandEncoder> beginEncoder,
+            @Nullable final Consumer<MTLRenderCommandEncoder> finishEncoder
     ) {
         try (AutoreleasePool _ = AutoreleasePool.push()) {
             if (width <= 0 || height <= 0) {
@@ -249,16 +257,21 @@ public final class MTLBuiltinPipelines {
                 encoder = commandBuffer.makeRenderCommandEncoder(renderPass);
             }
 
+            if (beginEncoder != null) {
+                beginEncoder.accept(encoder);
+            }
+
             if (globalFence != null) {
                 encoder.waitForFence(globalFence, MTLRenderStages.Fragment);
-            } else if (commandBuffer.isMetal4()) {
-                encoder.barrierAfterQueueStages(Long.MAX_VALUE, MTLRenderStages.Fragment.value, true);
             }
 
             if (!fullRegion) {
                 MemorySegment pipeline = ensureClearPipeline(MTLTexture.pixelFormat(colorTexture), MTLTexture.pixelFormat(depthTexture), true);
                 MemorySegment depthState = ensureDepthStencilState(MTLCompareFunction.Always, true);
                 if (ObjC.isNil(pipeline) || ObjC.isNil(depthState)) {
+                    if (finishEncoder != null) {
+                        finishEncoder.accept(encoder);
+                    }
                     encoder.endEncoding();
                     return;
                 }
@@ -275,6 +288,10 @@ public final class MTLBuiltinPipelines {
                 encoder.updateFence(globalFence, MTLRenderStages.Fragment);
             }
 
+            if (finishEncoder != null) {
+                finishEncoder.accept(encoder);
+            }
+
             encoder.endEncoding();
         }
     }
@@ -283,7 +300,9 @@ public final class MTLBuiltinPipelines {
             final MTLCommandBuffer commandBuffer,
             final CAMetalLayer layer,
             final MemorySegment sourceTexture,
-            final MTLFence globalFence
+            final MTLFence globalFence,
+            @Nullable final Consumer<MTLRenderCommandEncoder> beginEncoder,
+            @Nullable final Consumer<MTLRenderCommandEncoder> finishEncoder
     ) {
         try (AutoreleasePool _ = AutoreleasePool.push()) {
             long drawableStart = Stats.enabled() ? System.nanoTime() : 0L;
@@ -308,10 +327,12 @@ public final class MTLBuiltinPipelines {
                 encoder = commandBuffer.makeRenderCommandEncoder(renderPass);
             }
 
+            if (beginEncoder != null) {
+                beginEncoder.accept(encoder);
+            }
+
             if (globalFence != null) {
                 encoder.waitForFence(globalFence, MTLRenderStages.Fragment);
-            } else if (commandBuffer.isMetal4()) {
-                encoder.barrierAfterQueueStages(Long.MAX_VALUE, MTLRenderStages.Fragment.value, true);
             }
 
             long drawableWidth = MTLTexture.width(drawableTexture);
@@ -328,6 +349,10 @@ public final class MTLBuiltinPipelines {
 
             if (globalFence != null) {
                 encoder.updateFence(globalFence, MTLRenderStages.Fragment);
+            }
+
+            if (finishEncoder != null) {
+                finishEncoder.accept(encoder);
             }
 
             encoder.endEncoding();
@@ -434,11 +459,16 @@ public final class MTLBuiltinPipelines {
         }
         MemorySegment pipeline;
         try (MTLRenderPipelineDescriptor descriptor = new MTLRenderPipelineDescriptor()) {
+            descriptor.setLabel(vertexEntry + "/" + fragmentEntry);
             descriptor.setCompiledFunctions(vertexFunction, fragmentFunction);
             descriptor.setColorAttachmentFormat(0, colorFormat);
             descriptor.setDepthStencilFormats(depthFormat, MTLPixelFormat.Invalid.value);
             descriptor.disableBlending(0, writeMask);
-            pipeline = device.newRenderPipelineState(descriptor);
+            if (metal3Archive != null) {
+                descriptor.setBinaryArchive(metal3Archive.handle());
+                metal3Archive.addRenderPipeline(descriptor);
+            }
+            pipeline = device.newRenderPipelineStateAsync(descriptor);
         }
         if (!ObjC.isNil(pipeline) && residencySet != null) {
             residencySet.addAllocation(pipeline);

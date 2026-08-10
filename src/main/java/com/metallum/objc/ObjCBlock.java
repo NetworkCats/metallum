@@ -8,6 +8,10 @@ import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.util.function.Consumer;
+import java.util.function.BiConsumer;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static java.lang.foreign.ValueLayout.*;
 
@@ -20,6 +24,10 @@ public final class ObjCBlock {
     private static final MemorySegment BLOCK_DESCRIPTOR;
     private static final MethodHandle INVOKE_RUNNABLE;
     private static final MethodHandle INVOKE_CONSUMER;
+    private static final MethodHandle INVOKE_BI_CONSUMER_ONCE;
+    private static final int COMPLETION_SLOT_COUNT = 16;
+    private static final BlockingQueue<CompletionSlot> COMPLETION_SLOTS =
+            new ArrayBlockingQueue<>(COMPLETION_SLOT_COUNT);
 
     static {
         BLOCK_DESCRIPTOR = BLOCK_ARENA.allocate(16, 8);
@@ -36,8 +44,21 @@ public final class ObjCBlock {
                     "invokeConsumer",
                     MethodType.methodType(void.class, Consumer.class, MemorySegment.class, MemorySegment.class)
             );
+            INVOKE_BI_CONSUMER_ONCE = MethodHandles.lookup().findStatic(
+                    ObjCBlock.class,
+                    "invokeBiConsumerOnce",
+                    MethodType.methodType(
+                            void.class,
+                            AtomicReference.class,
+                            MemorySegment.class,
+                            MemorySegment.class,
+                            MemorySegment.class)
+            );
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("Failed to resolve block invoke handle", e);
+        }
+        for (int i = 0; i < COMPLETION_SLOT_COUNT; i++) {
+            COMPLETION_SLOTS.add(new CompletionSlot());
         }
     }
 
@@ -54,10 +75,35 @@ public final class ObjCBlock {
         return createBlock(target);
     }
 
+    /**
+     * Borrows one of a bounded set of global completion blocks. The lease must
+     * remain open until the native callback has run.
+     */
+    public static CompletionLease leaseBiConsumer(
+            final BiConsumer<MemorySegment, MemorySegment> action
+    ) {
+        final CompletionSlot slot;
+        try {
+            slot = COMPLETION_SLOTS.take();
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while waiting for an Objective-C completion block", exception);
+        }
+        slot.action.set(action);
+        return new CompletionLease(slot);
+    }
+
     private static MemorySegment createBlock(final MethodHandle target) {
+        return createBlock(target, FunctionDescriptor.ofVoid(ADDRESS, ADDRESS));
+    }
+
+    private static MemorySegment createBlock(
+            final MethodHandle target,
+            final FunctionDescriptor descriptor
+    ) {
         MemorySegment invoke = ObjC.LINKER.upcallStub(
                 target,
-                FunctionDescriptor.ofVoid(ADDRESS, ADDRESS),
+                descriptor,
                 BLOCK_ARENA
         );
 
@@ -80,5 +126,60 @@ public final class ObjCBlock {
             final MemorySegment argument
     ) {
         action.accept(argument);
+    }
+
+    private static void invokeBiConsumerOnce(
+            final AtomicReference<BiConsumer<MemorySegment, MemorySegment>> reference,
+            final MemorySegment block,
+            final MemorySegment first,
+            final MemorySegment second
+    ) {
+        BiConsumer<MemorySegment, MemorySegment> action = reference.getAndSet(null);
+        if (action != null) {
+            action.accept(first, second);
+        }
+    }
+
+    private static final class CompletionSlot {
+        private final AtomicReference<BiConsumer<MemorySegment, MemorySegment>> action =
+                new AtomicReference<>();
+        private final MemorySegment block;
+
+        private CompletionSlot() {
+            MethodHandle target = MethodHandles.insertArguments(
+                    INVOKE_BI_CONSUMER_ONCE, 0, this.action);
+            this.block = createBlock(
+                    target,
+                    FunctionDescriptor.ofVoid(ADDRESS, ADDRESS, ADDRESS));
+        }
+    }
+
+    public static final class CompletionLease implements AutoCloseable {
+        private CompletionSlot slot;
+
+        private CompletionLease(final CompletionSlot slot) {
+            this.slot = slot;
+        }
+
+        public MemorySegment block() {
+            CompletionSlot current = this.slot;
+            if (current == null) {
+                throw new IllegalStateException("Objective-C completion block lease is closed");
+            }
+            return current.block;
+        }
+
+        @Override
+        public void close() {
+            CompletionSlot current = this.slot;
+            if (current == null) {
+                return;
+            }
+            this.slot = null;
+            current.action.set(null);
+            if (!COMPLETION_SLOTS.offer(current)) {
+                throw new IllegalStateException("Objective-C completion block pool overflow");
+            }
+        }
     }
 }

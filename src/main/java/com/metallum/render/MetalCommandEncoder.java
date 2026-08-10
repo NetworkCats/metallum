@@ -31,7 +31,8 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
     static final long STAGE_FRAGMENT = 1L << 1;
     static final long STAGE_BLIT = 1L << 28;
     private static final boolean RESOURCE_TRACKER_ENABLED =
-            Boolean.getBoolean("metallum.resourceTracker");
+            !Boolean.getBoolean("metallum.globalFence")
+                    && !"false".equalsIgnoreCase(System.getProperty("metallum.resourceTracker"));
     private final MetalDevice device;
     private long currentSubmitIndex = MAX_SUBMITS_IN_FLIGHT;
     private final InFlight[] inFlight = new InFlight[MAX_SUBMITS_IN_FLIGHT];
@@ -56,6 +57,8 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
     private MemorySegment renderColorAttachment = MemorySegment.NULL;
     private MemorySegment renderDepthAttachment = MemorySegment.NULL;
     private final Long2ObjectOpenHashMap<ArrayDeque<MTLBuffer>> dynamicBackingPool = new Long2ObjectOpenHashMap<>();
+    private final Set<MetalGpuBuffer> pendingDynamicBuffers =
+            Collections.newSetFromMap(new IdentityHashMap<>());
 
     MetalCommandEncoder(final MetalDevice device) {
         this.device = device;
@@ -101,8 +104,7 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         if (currentEncoder != null) {
             if (currentEncoder instanceof MTLRenderCommandEncoder renderEncoder) {
                 if (trackerEnabled() && !renderEncoder.isMetal4()) {
-                    renderEncoder.updateFence(requireActiveDependencyFence(), MTLRenderStages.VertexAndFragment);
-                    Stats.increment(Stats.Counter.FENCE_UPDATES);
+                    updateTrackedRenderFence(renderEncoder);
                 } else if (!trackerEnabled()) {
                     renderEncoder.updateFence(fence, MTLRenderStages.VertexAndFragment);
                     Stats.increment(Stats.Counter.FENCE_UPDATES);
@@ -112,8 +114,10 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
                 }
             } else if (currentEncoder instanceof MTLBlitCommandEncoder blitEncoder) {
                 if (trackerEnabled() && !blitEncoder.isMetal4()) {
-                    blitEncoder.updateFence(requireActiveDependencyFence());
-                    Stats.increment(Stats.Counter.FENCE_UPDATES);
+                    if (this.accessTracker.stagesForEncoder(this.activeEncoderId) != 0L) {
+                        blitEncoder.updateFence(requireActiveDependencyFence());
+                        Stats.increment(Stats.Counter.FENCE_UPDATES);
+                    }
                 } else if (!trackerEnabled()) {
                     blitEncoder.updateFence(fence);
                     Stats.increment(Stats.Counter.FENCE_UPDATES);
@@ -136,8 +140,9 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
     @Override
     public void submit() {
         InFlight toClose = null;
+        submitRenderPass();
+        materializeAllDynamicWrites();
         if (commandBuffer != null) {
-            submitRenderPass();
             endEncoder();
 
             int slot = (int) (currentSubmitIndex % MAX_SUBMITS_IN_FLIGHT);
@@ -317,7 +322,18 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         commandBuffer.encodePresentTextureToDrawable(
                 layer,
                 source.nativeHandle(),
-                trackerEnabled() ? null : fence
+                trackerEnabled() ? null : fence,
+                trackerEnabled() ? encoder -> beginExternalRenderEncoder(
+                        encoder,
+                        () -> textureAccess(
+                                source,
+                                textureView.baseMipLevel(),
+                                textureView.mipLevels(),
+                                0,
+                                source.getDepthOrLayers(),
+                                ResourceAccessTracker.Access.READ,
+                                STAGE_FRAGMENT)) : null,
+                trackerEnabled() ? this::finishExternalRenderEncoder : null
         );
     }
 
@@ -366,18 +382,19 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
                 regionY,
                 regionWidth,
                 regionHeight,
-                trackerEnabled() ? null : fence
+                trackerEnabled() ? null : fence,
+                trackerEnabled() ? encoder -> beginExternalRenderEncoder(
+                        encoder,
+                        () -> {
+                            textureAccess(
+                                    color, 0, color.getMipLevels(), 0, color.getDepthOrLayers(),
+                                    ResourceAccessTracker.Access.WRITE, STAGE_FRAGMENT);
+                            textureAccess(
+                                    depth, 0, depth.getMipLevels(), 0, depth.getDepthOrLayers(),
+                                    ResourceAccessTracker.Access.WRITE, STAGE_FRAGMENT);
+                        }) : null,
+                trackerEnabled() ? this::finishExternalRenderEncoder : null
         );
-        if (trackerEnabled()) {
-            this.accessTracker.reset();
-            this.accessTracker.beginEncoder();
-            this.accessTracker.accessTexture(
-                    color, 0, color.getMipLevels(), 0, color.getDepthOrLayers(),
-                    ResourceAccessTracker.Access.WRITE, STAGE_FRAGMENT);
-            this.accessTracker.accessTexture(
-                    depth, 0, depth.getMipLevels(), 0, depth.getDepthOrLayers(),
-                    ResourceAccessTracker.Access.WRITE, STAGE_FRAGMENT);
-        }
     }
 
     @Override
@@ -391,7 +408,7 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         int length = data.remaining();
 
         if (buffer.isDynamic()) {
-            orphanWrite(buffer, destination.offset(), data);
+            queueDynamicWrite(buffer, destination.offset(), data);
             return;
         }
 
@@ -412,30 +429,48 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         );
     }
 
-    private void orphanWrite(final MetalGpuBuffer buffer, final long offset, final ByteBuffer data) {
+    private void queueDynamicWrite(final MetalGpuBuffer buffer, final long offset, final ByteBuffer data) {
         if (buffer.canUpdateBackingInPlace(this.currentSubmitIndex)) {
             ByteBuffer destination = buffer.currentStorage();
             destination.position(Math.toIntExact(offset));
             destination.put(data.duplicate());
             return;
         }
+        buffer.queueDynamicWrite(this.currentSubmitIndex, offset, data);
+        this.pendingDynamicBuffers.add(buffer);
+    }
+
+    boolean materializeDynamicWrites(final MetalGpuBuffer buffer) {
+        if (!buffer.hasPendingWrites(this.currentSubmitIndex)) {
+            return false;
+        }
         long size = buffer.allocationSize();
         MTLBuffer old = buffer.metalBuffer();
         MTLBuffer fresh = acquireDynamicBacking(size, buffer.resourceOptions());
         ByteBuffer freshStorage = ObjC.byteBufferView(fresh.contents(), size).order(ByteOrder.nativeOrder());
 
-        if (offset != 0 || data.remaining() != buffer.size()) {
+        if (!buffer.pendingWritesCoverWholeBuffer()) {
             ByteBuffer previous = buffer.currentStorage();
             previous.clear();
             freshStorage.duplicate().put(previous);
         }
-
-        ByteBuffer dst = freshStorage.duplicate().order(ByteOrder.nativeOrder());
-        dst.position(Math.toIntExact(offset));
-        dst.put(data.duplicate());
+        buffer.applyPendingWrites(freshStorage);
 
         buffer.swapBacking(fresh, freshStorage, this.currentSubmitIndex);
         recycleDynamicBacking(old, size);
+        this.pendingDynamicBuffers.remove(buffer);
+        return true;
+    }
+
+    private void materializeAllDynamicWrites() {
+        if (this.pendingDynamicBuffers.isEmpty()) {
+            return;
+        }
+        MetalGpuBuffer[] pending = this.pendingDynamicBuffers.toArray(MetalGpuBuffer[]::new);
+        for (MetalGpuBuffer buffer : pending) {
+            materializeDynamicWrites(buffer);
+        }
+        this.pendingDynamicBuffers.clear();
     }
 
     private MTLBuffer acquireDynamicBacking(final long size, final long resourceOptions) {
@@ -676,6 +711,7 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
     }
 
     void markGpuUse(final MetalGpuBuffer buffer) {
+        materializeDynamicWrites(buffer);
         buffer.markGpuUse(this.currentSubmitIndex);
     }
 
@@ -732,8 +768,8 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             return;
         }
 
-        for (long producer : dependency.producerEncoders()) {
-            MTLFence producerFence = dependencyFence(producer);
+        for (int index = 0; index < dependency.producerCount(); index++) {
+            MTLFence producerFence = dependencyFence(dependency.producerEncoder(index));
             if (encoder instanceof MTLRenderCommandEncoder renderEncoder) {
                 renderEncoder.waitForFence(producerFence, renderStages(dependency.consumerStages()));
             } else if (encoder instanceof MTLBlitCommandEncoder blitEncoder) {
@@ -761,6 +797,40 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         return this.activeDependencyFence;
     }
 
+    private void beginExternalRenderEncoder(
+            final MTLRenderCommandEncoder encoder,
+            final Runnable declareAccesses
+    ) {
+        if (this.currentEncoder != null) {
+            throw new IllegalStateException("External Metal encoder started while another encoder is active");
+        }
+        Stats.increment(Stats.Counter.ENCODER_SWITCHES);
+        beginTrackedEncoder(encoder);
+        this.currentEncoder = encoder;
+        declareAccesses.run();
+    }
+
+    private void finishExternalRenderEncoder(final MTLRenderCommandEncoder encoder) {
+        if (this.currentEncoder != encoder) {
+            throw new IllegalStateException("Unexpected external Metal encoder completion");
+        }
+        if (!encoder.isMetal4()) {
+            updateTrackedRenderFence(encoder);
+        }
+        this.currentEncoder = null;
+        this.activeEncoderId = -1L;
+        this.activeDependencyFence = null;
+    }
+
+    private void updateTrackedRenderFence(final MTLRenderCommandEncoder encoder) {
+        long stages = this.accessTracker.stagesForEncoder(this.activeEncoderId);
+        if (stages == 0L) {
+            return;
+        }
+        encoder.updateFence(requireActiveDependencyFence(), renderStages(stages));
+        Stats.increment(Stats.Counter.FENCE_UPDATES);
+    }
+
     private static MTLRenderStages renderStages(final long stages) {
         boolean vertex = (stages & STAGE_VERTEX) != 0L;
         boolean fragment = (stages & STAGE_FRAGMENT) != 0L;
@@ -771,9 +841,7 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
     }
 
     private boolean trackerEnabled() {
-        // Keep Metal 3 on its validated global-fence path until the range-based
-        // fence pool has completed hardware validation.
-        return RESOURCE_TRACKER_ENABLED && this.device.usesMetal4CommandPath();
+        return RESOURCE_TRACKER_ENABLED;
     }
 
     boolean awaitSubmitCompletion(final long submitIndex, final long timeoutMs) {
@@ -832,6 +900,7 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             }
         }
         dynamicBackingPool.clear();
+        pendingDynamicBuffers.clear();
     }
 
     void waitForSubmittedGpuWork() {

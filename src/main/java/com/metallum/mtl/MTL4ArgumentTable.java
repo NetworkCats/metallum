@@ -8,6 +8,7 @@ import net.fabricmc.api.Environment;
 import org.jspecify.annotations.Nullable;
 
 import java.lang.foreign.MemorySegment;
+import java.util.Arrays;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
 import static java.lang.foreign.ValueLayout.JAVA_BOOLEAN;
@@ -35,9 +36,15 @@ public final class MTL4ArgumentTable implements AutoCloseable {
     private static final Msg GPU_RESOURCE_ID = Msg.of("gpuResourceID", JAVA_LONG);
 
     private MemorySegment handle;
+    private final long[] bufferAddresses = new long[MAX_BUFFERS];
+    private final long[] textureIds = new long[MAX_TEXTURES];
+    private final long[] samplerIds = new long[MAX_SAMPLERS];
 
     private MTL4ArgumentTable(final MemorySegment handle) {
         this.handle = handle;
+        Arrays.fill(this.bufferAddresses, Long.MIN_VALUE);
+        Arrays.fill(this.textureIds, Long.MIN_VALUE);
+        Arrays.fill(this.samplerIds, Long.MIN_VALUE);
     }
 
     static MTL4ArgumentTable create(final MTLDevice device, @Nullable final String label) {
@@ -81,19 +88,39 @@ public final class MTL4ArgumentTable implements AutoCloseable {
         return this.handle;
     }
 
-    void setBufferAddress(final long address, final long index) {
+    boolean setBufferAddress(final long address, final long index) {
         requireIndex(index, MAX_BUFFERS, "buffer");
+        int slot = (int) index;
+        if (this.bufferAddresses[slot] == address) {
+            return false;
+        }
         SET_ADDRESS.send(handle(), address, index);
+        this.bufferAddresses[slot] = address;
+        return true;
     }
 
-    void setTexture(final MemorySegment texture, final long index) {
+    boolean setTexture(final MemorySegment texture, final long index) {
         requireIndex(index, MAX_TEXTURES, "texture");
-        SET_TEXTURE.send(handle(), resourceId(texture), index);
+        int slot = (int) index;
+        long resourceId = resourceId(texture);
+        if (this.textureIds[slot] == resourceId) {
+            return false;
+        }
+        SET_TEXTURE.send(handle(), resourceId, index);
+        this.textureIds[slot] = resourceId;
+        return true;
     }
 
-    void setSampler(final MemorySegment sampler, final long index) {
+    boolean setSampler(final MemorySegment sampler, final long index) {
         requireIndex(index, MAX_SAMPLERS, "sampler");
-        SET_SAMPLER.send(handle(), resourceId(sampler), index);
+        int slot = (int) index;
+        long resourceId = resourceId(sampler);
+        if (this.samplerIds[slot] == resourceId) {
+            return false;
+        }
+        SET_SAMPLER.send(handle(), resourceId, index);
+        this.samplerIds[slot] = resourceId;
+        return true;
     }
 
     private static long resourceId(final MemorySegment resource) {

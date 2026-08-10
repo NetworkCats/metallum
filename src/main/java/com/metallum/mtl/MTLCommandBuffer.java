@@ -11,6 +11,7 @@ import org.jspecify.annotations.Nullable;
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Consumer;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
@@ -176,7 +177,9 @@ public final class MTLCommandBuffer {
             final int regionY,
             final int regionWidth,
             final int regionHeight,
-            final MTLFence globalFence
+            final MTLFence globalFence,
+            @Nullable final Consumer<MTLRenderCommandEncoder> beginEncoder,
+            @Nullable final Consumer<MTLRenderCommandEncoder> finishEncoder
     ) {
         MTLBuiltinPipelines.clearColorDepthTexturesRegion(
                 this,
@@ -188,12 +191,21 @@ public final class MTLCommandBuffer {
                 regionY,
                 regionWidth,
                 regionHeight,
-                globalFence
+                globalFence,
+                beginEncoder,
+                finishEncoder
         );
     }
 
-    public void encodePresentTextureToDrawable(final CAMetalLayer layer, final MemorySegment sourceTexture, final MTLFence globalFence) {
-        MTLBuiltinPipelines.encodePresentTextureToDrawable(this, layer, sourceTexture, globalFence);
+    public void encodePresentTextureToDrawable(
+            final CAMetalLayer layer,
+            final MemorySegment sourceTexture,
+            final MTLFence globalFence,
+            @Nullable final Consumer<MTLRenderCommandEncoder> beginEncoder,
+            @Nullable final Consumer<MTLRenderCommandEncoder> finishEncoder
+    ) {
+        MTLBuiltinPipelines.encodePresentTextureToDrawable(
+                this, layer, sourceTexture, globalFence, beginEncoder, finishEncoder);
     }
 
     void presentDrawable(final CAMetalDrawable drawable) {

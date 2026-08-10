@@ -105,6 +105,60 @@ final class ResourceAccessTrackerTest {
         assertTrue(dependency.deviceVisibility());
     }
 
+    @Test
+    void partialBufferConflictPreservesUncoveredWriteRange() {
+        ResourceAccessTracker tracker = new ResourceAccessTracker();
+        Object buffer = new Object();
+        tracker.beginEncoder();
+        tracker.accessBuffer(buffer, 0, 100, ResourceAccessTracker.Access.WRITE, BLIT);
+
+        tracker.beginEncoder();
+        assertTrue(tracker.accessBuffer(
+                buffer, 0, 10, ResourceAccessTracker.Access.READ, VERTEX).hasPriorDependency());
+
+        tracker.beginEncoder();
+        ResourceAccessTracker.Dependency remaining = tracker.accessBuffer(
+                buffer, 50, 10, ResourceAccessTracker.Access.READ, FRAGMENT);
+        assertTrue(remaining.hasPriorDependency());
+        assertTrue(remaining.deviceVisibility());
+        assertArrayEquals(new long[]{0L}, remaining.producerEncoders());
+    }
+
+    @Test
+    void coalescingReadsDoesNotHideAdjacentWriteHazard() {
+        ResourceAccessTracker tracker = new ResourceAccessTracker();
+        Object buffer = new Object();
+        tracker.beginEncoder();
+        tracker.accessBuffer(buffer, 0, 100, ResourceAccessTracker.Access.WRITE, BLIT);
+
+        tracker.beginEncoder();
+        tracker.accessBuffer(buffer, 0, 10, ResourceAccessTracker.Access.READ, VERTEX);
+        ResourceAccessTracker.Dependency widerRead = tracker.accessBuffer(
+                buffer, 0, 20, ResourceAccessTracker.Access.READ, VERTEX);
+
+        assertTrue(widerRead.hasPriorDependency());
+        assertTrue(widerRead.deviceVisibility());
+    }
+
+    @Test
+    void partialTextureConflictPreservesOtherMipLayerRectangle() {
+        ResourceAccessTracker tracker = new ResourceAccessTracker();
+        Object texture = new Object();
+        tracker.beginEncoder();
+        tracker.accessTexture(
+                texture, 0, 4, 0, 4, ResourceAccessTracker.Access.WRITE, BLIT);
+
+        tracker.beginEncoder();
+        tracker.accessTexture(
+                texture, 1, 1, 1, 1, ResourceAccessTracker.Access.READ, FRAGMENT);
+
+        tracker.beginEncoder();
+        ResourceAccessTracker.Dependency remaining = tracker.accessTexture(
+                texture, 3, 1, 3, 1, ResourceAccessTracker.Access.READ, FRAGMENT);
+        assertTrue(remaining.hasPriorDependency());
+        assertTrue(remaining.deviceVisibility());
+    }
+
     private static void assertNoDependency(final ResourceAccessTracker.Dependency dependency) {
         assertFalse(dependency.hasPriorDependency());
         assertFalse(dependency.hasSameEncoderDependency());

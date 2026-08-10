@@ -6,20 +6,19 @@ import com.metallum.objc.ObjC;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.util.ArrayDeque;
 import java.lang.foreign.MemorySegment;
 
 @Environment(EnvType.CLIENT)
 final class MetalDestructionQueue {
-    private final List<DestroyAction>[] queues;
+    private final ArrayDeque<DestroyAction>[] queues;
     private int currentQueueIndex;
 
     @SuppressWarnings("unchecked")
     MetalDestructionQueue(final int queueCount) {
-        this.queues = (List<DestroyAction>[]) new List<?>[queueCount];
+        this.queues = (ArrayDeque<DestroyAction>[]) new ArrayDeque<?>[queueCount];
         for (int i = 0; i < queueCount; i++) {
-            this.queues[i] = new ArrayList<>();
+            this.queues[i] = new ArrayDeque<>();
         }
     }
 
@@ -53,21 +52,29 @@ final class MetalDestructionQueue {
 
     void rotate() {
         this.currentQueueIndex = (this.currentQueueIndex + 1) % this.queues.length;
-        List<DestroyAction> toDestroy = this.queues[this.currentQueueIndex];
-        for (DestroyAction destroyAction : toDestroy) {
+        ArrayDeque<DestroyAction> toDestroy = this.queues[this.currentQueueIndex];
+        int queuedAtRotation = toDestroy.size();
+        for (int i = 0; i < queuedAtRotation; i++) {
+            DestroyAction destroyAction = toDestroy.removeFirst();
             try {
                 destroyAction.destroy();
             } catch (Exception e) {
                 Metallum.LOGGER.error("[metallum] Destroy action threw an exception; resource may have leaked", e);
             }
         }
-        toDestroy.clear();
     }
 
     void close() {
-        for (int i = 0; i < this.queues.length; i++) {
-            this.rotate();
-        }
+        boolean pending;
+        do {
+            for (int i = 0; i < this.queues.length; i++) {
+                this.rotate();
+            }
+            pending = false;
+            for (ArrayDeque<DestroyAction> queue : this.queues) {
+                pending |= !queue.isEmpty();
+            }
+        } while (pending);
     }
 
     private sealed interface DestroyAction permits CallbackAction, ObjCReleaseAction,

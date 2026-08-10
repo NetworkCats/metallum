@@ -4,6 +4,7 @@ import com.metallum.Metallum;
 import com.metallum.objc.AutoreleasePool;
 import com.metallum.objc.Msg;
 import com.metallum.objc.ObjC;
+import com.metallum.objc.ObjCBlock;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import org.jspecify.annotations.Nullable;
@@ -12,6 +13,8 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.MemorySegment;
 import java.lang.invoke.MethodHandle;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
@@ -30,14 +33,19 @@ public record MTLDevice(MemorySegment handle) {
     private static final Msg NEW_LIBRARY_WITH_SOURCE = Msg.of("newLibraryWithSource:options:error:", true, ADDRESS, ADDRESS, ADDRESS, ADDRESS);
     private static final Msg NEW_FUNCTION_WITH_NAME = Msg.of("newFunctionWithName:", true, ADDRESS, ADDRESS);
     private static final Msg NEW_RENDER_PIPELINE_STATE = Msg.of("newRenderPipelineStateWithDescriptor:error:", true, ADDRESS, ADDRESS, ADDRESS);
+    private static final Msg NEW_RENDER_PIPELINE_STATE_ASYNC = Msg.ofVoid(
+            "newRenderPipelineStateWithDescriptor:completionHandler:", true, ADDRESS, ADDRESS);
     private static final Msg LOCALIZED_DESCRIPTION = Msg.of("localizedDescription", ADDRESS);
     private static final Msg MINIMUM_TEXTURE_BUFFER_ALIGNMENT =
             Msg.of("minimumTextureBufferAlignmentForPixelFormat:", JAVA_LONG, JAVA_LONG);
     private static final Msg NAME = Msg.of("name", ADDRESS);
     private static final Msg MAX_BUFFER_LENGTH = Msg.of("maxBufferLength", JAVA_LONG);
     private static final Msg RECOMMENDED_MAX_WORKING_SET_SIZE = Msg.of("recommendedMaxWorkingSetSize", JAVA_LONG);
+    private static final Msg REGISTRY_ID = Msg.of("registryID", JAVA_LONG);
     private static final Msg SET_MAXIMIZE_CONCURRENT_COMPILATION =
             Msg.ofVoid("setShouldMaximizeConcurrentCompilation:", java.lang.foreign.ValueLayout.JAVA_BOOLEAN);
+    private static final Msg MAXIMUM_CONCURRENT_COMPILATION_TASK_COUNT =
+            Msg.of("maximumConcurrentCompilationTaskCount", JAVA_LONG);
 
     private static final String METAL_4_QUEUE_SELECTOR = "newMTL4CommandQueue";
     private static final String CONCURRENT_COMPILATION_SELECTOR = "setShouldMaximizeConcurrentCompilation:";
@@ -72,6 +80,10 @@ public record MTLDevice(MemorySegment handle) {
         return RECOMMENDED_MAX_WORKING_SET_SIZE.sendLong(handle);
     }
 
+    public long registryId() {
+        return ObjC.respondsToSelector(handle, "registryID") ? REGISTRY_ID.sendLong(handle) : 0L;
+    }
+
     public boolean supportsMetal4() {
         return ObjC.respondsToSelector(handle, METAL_4_QUEUE_SELECTOR);
     }
@@ -82,6 +94,15 @@ public record MTLDevice(MemorySegment handle) {
         }
         SET_MAXIMIZE_CONCURRENT_COMPILATION.send(handle, true);
         return true;
+    }
+
+    public int maximumConcurrentCompilationTaskCount() {
+        if (!ObjC.respondsToSelector(handle, "maximumConcurrentCompilationTaskCount")) {
+            return 0;
+        }
+        return Math.toIntExact(Math.min(
+                Integer.MAX_VALUE,
+                MAXIMUM_CONCURRENT_COMPILATION_TASK_COUNT.sendLong(handle)));
     }
 
     public MTLBuffer newBuffer(final long length, final long options) {
@@ -194,6 +215,36 @@ public record MTLDevice(MemorySegment handle) {
                 return MemorySegment.NULL;
             }
             return pipeline;
+        }
+    }
+
+    public MemorySegment newRenderPipelineStateAsync(final MTLRenderPipelineDescriptor descriptor) {
+        if (!ObjC.respondsToSelector(handle, "newRenderPipelineStateWithDescriptor:completionHandler:")) {
+            return newRenderPipelineState(descriptor);
+        }
+        CompletableFuture<MemorySegment> completion = new CompletableFuture<>();
+        try (ObjCBlock.CompletionLease lease = ObjCBlock.leaseBiConsumer((pipeline, error) -> {
+            try (AutoreleasePool ignored = AutoreleasePool.push()) {
+                if (!ObjC.isNil(pipeline)) {
+                    completion.complete(ObjC.retain(pipeline));
+                } else {
+                    String message = ObjC.isNil(error)
+                            ? "unknown error"
+                            : ObjC.javaString(LOCALIZED_DESCRIPTION.sendPtr(error));
+                    completion.completeExceptionally(new IllegalStateException(message));
+                }
+            } catch (Throwable throwable) {
+                completion.completeExceptionally(throwable);
+            }
+        })) {
+            NEW_RENDER_PIPELINE_STATE_ASYNC.send(handle, descriptor.handle(), lease.block());
+            try {
+                return completion.join();
+            } catch (CompletionException exception) {
+                Metallum.LOGGER.error("[metallum] Failed to create render pipeline state asynchronously: {}",
+                        exception.getCause() == null ? exception.getMessage() : exception.getCause().getMessage());
+                return MemorySegment.NULL;
+            }
         }
     }
 

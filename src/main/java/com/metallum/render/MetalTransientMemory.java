@@ -19,37 +19,43 @@ import java.util.List;
 
 @Environment(EnvType.CLIENT)
 final class MetalTransientMemory implements TransientMemory {
-    private static final long BLOCK_SIZE = 524288L;
     private static final long MAX_CPU_ALIGNMENT = 16L;
     private static final long MAX_GPU_ALIGNMENT = Long.highestOneBit(Long.MAX_VALUE);
     private static final int BLOCK_USAGE = GpuBuffer.USAGE_MAP_READ | GpuBuffer.USAGE_MAP_WRITE;
 
     private final MetalDevice device;
     private final MetalCommandEncoder encoder;
-    private final TransientBlockAllocator<Long> cpuBlockAllocator = new TransientBlockAllocator<>(
-            BLOCK_SIZE, MAX_CPU_ALIGNMENT, TransientBlockAllocator.Allocator.create(MemoryUtil::nmemAlloc, MemoryUtil::nmemFree)
-    );
-    private final TransientBlockAllocator<MetalGpuBuffer> gpuBlockAllocator;
+    private final TransientBlockSizingPolicy sizingPolicy = new TransientBlockSizingPolicy();
+    private TransientBlockAllocator<Long> cpuBlockAllocator;
+    private TransientBlockAllocator<MetalGpuBuffer> gpuBlockAllocator;
+    private long blockSize;
     private long submitIndex = 0L;
     private long frameAllocatedBytes;
 
     MetalTransientMemory(final MetalDevice device, final MetalCommandEncoder encoder) {
         this.device = device;
         this.encoder = encoder;
-        this.gpuBlockAllocator = new TransientBlockAllocator<>(
-                BLOCK_SIZE, MAX_GPU_ALIGNMENT, TransientBlockAllocator.Allocator.create(this::allocateGpuBlock, this::freeGpuBlock)
-        );
+        this.blockSize = this.sizingPolicy.blockSize();
+        this.cpuBlockAllocator = createCpuAllocator(this.blockSize);
+        this.gpuBlockAllocator = createGpuAllocator(this.blockSize);
     }
 
     void rotate() {
         Stats.recordHighWater(Stats.Counter.TRANSIENT_HIGH_WATER_BYTES, this.frameAllocatedBytes);
         Stats.recordHighWater(
                 Stats.Counter.TRANSIENT_BLOCKS,
-                (this.frameAllocatedBytes + BLOCK_SIZE - 1L) / BLOCK_SIZE
+                (this.frameAllocatedBytes + this.blockSize - 1L) / this.blockSize
         );
+        long nextBlockSize = this.sizingPolicy.recordFrame(this.frameAllocatedBytes);
         this.frameAllocatedBytes = 0L;
-        cpuBlockAllocator.rotate().run();
-        encoder.queueForDestroy(gpuBlockAllocator.rotate());
+        Runnable releaseCpu = this.cpuBlockAllocator.rotate();
+        Runnable releaseGpu = this.gpuBlockAllocator.rotate();
+        releaseCpu.run();
+        if (nextBlockSize != this.blockSize) {
+            resizeAllocators(nextBlockSize, releaseGpu);
+        } else {
+            encoder.queueForDestroy(releaseGpu);
+        }
         submitIndex++;
     }
 
@@ -64,6 +70,35 @@ final class MetalTransientMemory implements TransientMemory {
 
     private void freeGpuBlock(final MetalGpuBuffer block) {
         block.close();
+    }
+
+    private static TransientBlockAllocator<Long> createCpuAllocator(final long blockSize) {
+        return new TransientBlockAllocator<>(
+                blockSize,
+                MAX_CPU_ALIGNMENT,
+                TransientBlockAllocator.Allocator.create(MemoryUtil::nmemAlloc, MemoryUtil::nmemFree)
+        );
+    }
+
+    private TransientBlockAllocator<MetalGpuBuffer> createGpuAllocator(final long blockSize) {
+        return new TransientBlockAllocator<>(
+                blockSize,
+                MAX_GPU_ALIGNMENT,
+                TransientBlockAllocator.Allocator.create(this::allocateGpuBlock, this::freeGpuBlock)
+        );
+    }
+
+    private void resizeAllocators(final long nextBlockSize, final Runnable releaseGpu) {
+        TransientBlockAllocator<Long> retiredCpu = this.cpuBlockAllocator;
+        TransientBlockAllocator<MetalGpuBuffer> retiredGpu = this.gpuBlockAllocator;
+        retiredCpu.close();
+        this.blockSize = nextBlockSize;
+        this.cpuBlockAllocator = createCpuAllocator(nextBlockSize);
+        this.gpuBlockAllocator = createGpuAllocator(nextBlockSize);
+        this.encoder.queueForDestroy(() -> {
+            releaseGpu.run();
+            retiredGpu.close();
+        });
     }
 
     @Override
@@ -150,14 +185,33 @@ final class MetalTransientMemory implements TransientMemory {
 
     private List<GpuBufferSlice> multiUpload(final List<ByteBuffer> data, final long alignment, @Usage final int usage) {
         ReferenceArrayList<GpuBufferSlice> uploaded = new ReferenceArrayList<>(data.size());
+        if (data.isEmpty()) {
+            return uploaded;
+        }
+
+        long packedSize = 0L;
         long uploadedBytes = 0L;
-        for (ByteBuffer currentBuffer : data) {
-            int length = currentBuffer.remaining();
-            try (MappedView view = allocateGpuMapped(length, alignment, usage)) {
-                MemoryUtil.memCopy(currentBuffer, view.data());
-                uploaded.add(view.slice());
+        for (ByteBuffer buffer : data) {
+            packedSize = Mth.roundToward(packedSize, alignment);
+            packedSize = Math.addExact(packedSize, buffer.remaining());
+            uploadedBytes = Math.addExact(uploadedBytes, buffer.remaining());
+        }
+
+        try (MappedView packed = allocateGpuMapped(packedSize, alignment, usage)) {
+            GpuBufferSlice allocation = packed.slice();
+            long destination = MemoryUtil.memAddress(packed.data());
+            long offset = 0L;
+            for (ByteBuffer buffer : data) {
+                offset = Mth.roundToward(offset, alignment);
+                int length = buffer.remaining();
+                MemoryUtil.memCopy(MemoryUtil.memAddress(buffer), destination + offset, length);
+                uploaded.add(new GpuBufferSlice(
+                        allocation.buffer(),
+                        allocation.offset() + offset,
+                        length
+                ));
+                offset += length;
             }
-            uploadedBytes += length;
         }
         Stats.add(Stats.Counter.UPLOAD_BYTES, uploadedBytes);
         return uploaded;

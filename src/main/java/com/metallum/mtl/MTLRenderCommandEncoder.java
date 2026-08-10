@@ -418,9 +418,9 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
             Stats.increment(Stats.Counter.BINDING_CACHE_HITS);
             return;
         }
-        requireArgumentTable().setBufferAddress(address, index);
+        boolean changed = requireArgumentTable().setBufferAddress(address, index);
         this.metal4BufferAddresses[(int) index] = address;
-        Stats.increment(Stats.Counter.BINDING_CALLS);
+        Stats.increment(changed ? Stats.Counter.BINDING_CALLS : Stats.Counter.BINDING_CACHE_HITS);
     }
 
     private void setMetal4BufferOffset(final long offset, final long index) {
@@ -436,9 +436,9 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
             Stats.increment(Stats.Counter.BINDING_CACHE_HITS);
             return;
         }
-        requireArgumentTable().setBufferAddress(address, index);
+        boolean changed = requireArgumentTable().setBufferAddress(address, index);
         this.metal4BufferAddresses[(int) index] = address;
-        Stats.increment(Stats.Counter.BINDING_CALLS);
+        Stats.increment(changed ? Stats.Counter.BINDING_CALLS : Stats.Counter.BINDING_CACHE_HITS);
     }
 
     private void setMetal4Texture(final MemorySegment texture, final long index) {
@@ -448,9 +448,9 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
             Stats.increment(Stats.Counter.BINDING_CACHE_HITS);
             return;
         }
-        requireArgumentTable().setTexture(texture, index);
+        boolean changed = requireArgumentTable().setTexture(texture, index);
         this.metal4Textures[slot] = resource;
-        Stats.increment(Stats.Counter.BINDING_CALLS);
+        Stats.increment(changed ? Stats.Counter.BINDING_CALLS : Stats.Counter.BINDING_CACHE_HITS);
     }
 
     private void setMetal4Sampler(final MemorySegment sampler, final long index) {
@@ -460,9 +460,9 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
             Stats.increment(Stats.Counter.BINDING_CACHE_HITS);
             return;
         }
-        requireArgumentTable().setSampler(sampler, index);
+        boolean changed = requireArgumentTable().setSampler(sampler, index);
         this.metal4Samplers[slot] = resource;
-        Stats.increment(Stats.Counter.BINDING_CALLS);
+        Stats.increment(changed ? Stats.Counter.BINDING_CALLS : Stats.Counter.BINDING_CACHE_HITS);
     }
 
     public void invalidateBindingCache() {
