@@ -15,11 +15,6 @@
   "accessWidener": "metallum.accesswidener",
   "icon": "assets/metallum/icon.png",
   "environment": "*",
-  "entrypoints": {
-    "main": [
-      "com.metallum.Metallum"
-    ]
-  },
   "mixins": [
     "metallum.mixins.json"
   ],
