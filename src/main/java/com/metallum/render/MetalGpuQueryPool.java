@@ -1,26 +1,61 @@
 package com.metallum.render;
 
+import com.metallum.mtl.MTLBlitCommandEncoder;
+import com.metallum.mtl.MTLGpuCounterPool;
+import com.metallum.mtl.MTLRenderCommandEncoder;
 import com.mojang.blaze3d.systems.GpuQueryPool;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import org.jspecify.annotations.NonNull;
 
+import java.lang.foreign.MemorySegment;
+import java.util.Arrays;
 import java.util.OptionalLong;
 
 @Environment(EnvType.CLIENT)
 final class MetalGpuQueryPool implements GpuQueryPool {
-    private final OptionalLong[] values;
+    private final MetalDevice device;
+    private final long[] values;
+    private final long[] written;
+    private final long[] resolved;
+    private MTLGpuCounterPool nativePool;
 
-    MetalGpuQueryPool(final int size) {
-        this.values = new OptionalLong[size];
-
-        for (int i = 0; i < size; i++) {
-            this.values[i] = OptionalLong.empty();
+    MetalGpuQueryPool(final MetalDevice device, final int size) {
+        if (size <= 0) {
+            throw new IllegalArgumentException("Timestamp query pool size must be positive");
         }
+        this.device = device;
+        this.values = new long[size];
+        this.written = new long[(size + Long.SIZE - 1) / Long.SIZE];
+        this.resolved = new long[this.written.length];
+        this.nativePool = MTLGpuCounterPool.create(
+                device.metalDevice(), size, device.usesMetal4CommandPath());
     }
 
-    void setValue(final int index, final long value) {
-        this.values[index] = OptionalLong.of(value);
+    void write(final MTLRenderCommandEncoder encoder, final int index) {
+        checkIndex(index);
+        this.values[index] = 0L;
+        clear(this.resolved, index);
+        if (this.nativePool != null) {
+            encoder.writeTimestamp(this.nativePool, index);
+        } else {
+            this.values[index] = System.nanoTime();
+            set(this.resolved, index);
+        }
+        set(this.written, index);
+    }
+
+    void write(final MTLBlitCommandEncoder encoder, final int index) {
+        checkIndex(index);
+        this.values[index] = 0L;
+        clear(this.resolved, index);
+        if (this.nativePool != null) {
+            encoder.writeTimestamp(this.nativePool, index);
+        } else {
+            this.values[index] = System.nanoTime();
+            set(this.resolved, index);
+        }
+        set(this.written, index);
     }
 
     @Override
@@ -30,20 +65,77 @@ final class MetalGpuQueryPool implements GpuQueryPool {
 
     @Override
     public @NonNull OptionalLong getValue(final int index) {
-        return this.values[index];
+        checkIndex(index);
+        resolveRange(index, 1);
+        return isSet(this.resolved, index)
+                ? OptionalLong.of(this.values[index])
+                : OptionalLong.empty();
     }
 
     @Override
     public OptionalLong @NonNull [] getValues(final int index, final int count) {
+        if (index < 0 || count < 0 || index > this.values.length - count) {
+            throw new IndexOutOfBoundsException("Invalid timestamp query range " + index + "+" + count);
+        }
+        resolveRange(index, count);
         OptionalLong[] result = new OptionalLong[count];
-        System.arraycopy(this.values, index, result, 0, count);
+        for (int i = 0; i < count; i++) {
+            int query = index + i;
+            result[i] = isSet(this.resolved, query)
+                    ? OptionalLong.of(this.values[query])
+                    : OptionalLong.empty();
+        }
         return result;
+    }
+
+    private void resolveRange(final int index, final int count) {
+        if (this.nativePool == null || count == 0) {
+            return;
+        }
+        boolean hasWrittenQuery = false;
+        for (int i = index; i < index + count; i++) {
+            if (isSet(this.written, i) && !isSet(this.resolved, i)) {
+                hasWrittenQuery = true;
+                break;
+            }
+        }
+        if (!hasWrittenQuery || !this.nativePool.resolve(this.values, index, count)) {
+            return;
+        }
+        for (int i = index; i < index + count; i++) {
+            if (isSet(this.written, i) && this.values[i] != 0L) {
+                set(this.resolved, i);
+            }
+        }
     }
 
     @Override
     public void close() {
-        for (int i = 0; i < this.values.length; i++) {
-            this.values[i] = OptionalLong.empty();
+        Arrays.fill(this.values, 0L);
+        Arrays.fill(this.written, 0L);
+        Arrays.fill(this.resolved, 0L);
+        if (this.nativePool != null) {
+            MemorySegment handle = this.nativePool.detach();
+            this.nativePool = null;
+            this.device.queueResourceRelease(handle);
         }
+    }
+
+    private void checkIndex(final int index) {
+        if (index < 0 || index >= this.values.length) {
+            throw new IndexOutOfBoundsException(index);
+        }
+    }
+
+    private static boolean isSet(final long[] bits, final int index) {
+        return (bits[index >>> 6] & (1L << index)) != 0L;
+    }
+
+    private static void set(final long[] bits, final int index) {
+        bits[index >>> 6] |= 1L << index;
+    }
+
+    private static void clear(final long[] bits, final int index) {
+        bits[index >>> 6] &= ~(1L << index);
     }
 }

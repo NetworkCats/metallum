@@ -50,8 +50,6 @@ public final class MTLCommandQueue {
     private final MTLDevice device;
     private final boolean metal4;
     @Nullable
-    private final MTL4ArgumentTable argumentTable;
-    @Nullable
     private final Metal4SubmissionSlot[] submissionSlots;
     @Nullable
     private MTLResidencySet residencySet;
@@ -63,18 +61,16 @@ public final class MTLCommandQueue {
             final MTLDevice device,
             final MemorySegment handle,
             final boolean metal4,
-            @Nullable final MTL4ArgumentTable argumentTable,
             @Nullable final Metal4SubmissionSlot[] submissionSlots
     ) {
         this.device = device;
         this.handle = handle;
         this.metal4 = metal4;
-        this.argumentTable = argumentTable;
         this.submissionSlots = submissionSlots;
     }
 
     static MTLCommandQueue legacy(final MTLDevice device, final MemorySegment handle) {
-        return new MTLCommandQueue(device, handle, false, null, null);
+        return new MTLCommandQueue(device, handle, false, null);
     }
 
     @Nullable
@@ -86,22 +82,17 @@ public final class MTLCommandQueue {
         }
 
         MemorySegment queue = MemorySegment.NULL;
-        MTL4ArgumentTable table = null;
         Metal4SubmissionSlot[] slots = null;
         try {
             queue = NEW_MTL4_COMMAND_QUEUE.sendPtr(device.handle());
             if (ObjC.isNil(queue)) {
                 return null;
             }
-            table = MTL4ArgumentTable.create(
-                    device,
-                    debugLabelsEnabled ? "Metallum argument table" : null
-            );
             slots = new Metal4SubmissionSlot[MAX_SUBMITS_IN_FLIGHT];
             for (int i = 0; i < slots.length; i++) {
                 slots[i] = Metal4SubmissionSlot.create(device, i);
             }
-            return new MTLCommandQueue(device, queue, true, table, slots);
+            return new MTLCommandQueue(device, queue, true, slots);
         } catch (RuntimeException exception) {
             Metallum.LOGGER.warn("[metallum] Failed to initialize the Metal 4 command path; falling back to Metal 3", exception);
             if (slots != null) {
@@ -110,9 +101,6 @@ public final class MTLCommandQueue {
                         slot.close();
                     }
                 }
-            }
-            if (table != null) {
-                table.close();
             }
             if (!ObjC.isNil(queue)) {
                 ObjC.release(queue);
@@ -152,8 +140,7 @@ public final class MTLCommandQueue {
 
     private MTLCommandBuffer makeMetal4CommandBuffer(@Nullable final String label) {
         Metal4SubmissionSlot[] slots = this.submissionSlots;
-        MTL4ArgumentTable table = this.argumentTable;
-        if (slots == null || table == null) {
+        if (slots == null) {
             throw new IllegalStateException("Metal 4 command queue is incomplete");
         }
         Metal4SubmissionSlot slot = slots[this.nextSubmissionSlot];
@@ -171,7 +158,7 @@ public final class MTLCommandQueue {
                     commandBuffer,
                     this,
                     slot,
-                    table,
+                    slot.argumentTable,
                     this.device,
                     this.residencySet
             );
@@ -247,9 +234,6 @@ public final class MTLCommandQueue {
                 slot.close();
             }
         }
-        if (this.argumentTable != null) {
-            this.argumentTable.close();
-        }
         ObjC.release(this.handle);
         this.handle = MemorySegment.NULL;
     }
@@ -258,16 +242,19 @@ public final class MTLCommandQueue {
         private final Semaphore completion = new Semaphore(0);
         private final MemorySegment allocator;
         private final MemorySegment commitOptions;
+        private final MTL4ArgumentTable argumentTable;
         @Nullable
         private volatile MTLCommandBuffer activeCommandBuffer;
         private volatile boolean submitted;
 
         private Metal4SubmissionSlot(
                 final MemorySegment allocator,
-                final MemorySegment commitOptions
+                final MemorySegment commitOptions,
+                final MTL4ArgumentTable argumentTable
         ) {
             this.allocator = allocator;
             this.commitOptions = commitOptions;
+            this.argumentTable = argumentTable;
         }
 
         static Metal4SubmissionSlot create(final MTLDevice device, final int index) {
@@ -280,7 +267,18 @@ public final class MTLCommandQueue {
                 ObjC.release(allocator);
                 throw new IllegalStateException("Failed to create MTL4CommitOptions " + index);
             }
-            Metal4SubmissionSlot slot = new Metal4SubmissionSlot(allocator, options);
+            MTL4ArgumentTable table;
+            try {
+                table = MTL4ArgumentTable.create(
+                        device,
+                        debugLabelsEnabled ? "Metallum argument table " + index : null
+                );
+            } catch (RuntimeException exception) {
+                ObjC.release(options);
+                ObjC.release(allocator);
+                throw exception;
+            }
+            Metal4SubmissionSlot slot = new Metal4SubmissionSlot(allocator, options, table);
             MemorySegment handler = ObjCBlock.withConsumer(slot::complete);
             ADD_FEEDBACK_HANDLER.send(options, handler);
             return slot;
@@ -353,6 +351,7 @@ public final class MTLCommandQueue {
         public void close() {
             ObjC.release(this.commitOptions);
             ObjC.release(this.allocator);
+            this.argumentTable.close();
         }
     }
 }

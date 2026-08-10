@@ -27,6 +27,7 @@ import org.jspecify.annotations.Nullable;
 import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
@@ -44,15 +45,16 @@ final class MetalDevice implements GpuDeviceBackend {
     @Nullable
     private final MTLResidencySet residencySet;
     private final boolean metal4Available;
+    private final boolean forceMetal3;
     private final boolean metal4CommandPath;
     @Nullable
     private final MTL4Compiler metal4Compiler;
     private final boolean concurrentCompilationEnabled;
     public final MTLCommandQueue commandQueue;
-    private final Map<RenderPipeline, MetalCompiledRenderPipeline> compiledPipelines = new IdentityHashMap<>();
-    private final Map<ShaderCompilationKey, IntermediaryShaderModule> shaderCache = new HashMap<>();
-    private final Map<String, MemorySegment> libraryCache = new HashMap<>();
-    private final Map<MslFunctionKey, MemorySegment> functionCache = new HashMap<>();
+    private final Map<RenderPipeline, MetalCompiledRenderPipeline> compiledPipelines = new ConcurrentHashMap<>();
+    private final Map<ShaderCompilationKey, CachedShaderModule> shaderCache = new ConcurrentHashMap<>();
+    private final Map<String, MemorySegment> libraryCache = new ConcurrentHashMap<>();
+    private final Map<MslFunctionKey, MemorySegment> functionCache = new ConcurrentHashMap<>();
     private final Map<Long, MemorySegment> depthStencilStates = new HashMap<>();
     private final ArrayDeque<String> debugMessages = new ArrayDeque<>();
     private final ShaderSource defaultShaderSource;
@@ -72,6 +74,7 @@ final class MetalDevice implements GpuDeviceBackend {
         this.metalLayer = metalLayer;
         this.cocoa = cocoa;
         this.metal4Available = this.metalDevice.supportsMetal4();
+        this.forceMetal3 = Boolean.getBoolean("metallum.forceMetal3");
         this.concurrentCompilationEnabled = this.metalDevice.enableConcurrentCompilation();
         this.residencySet = MTLResidencySet.create(
                 this.metalDevice,
@@ -80,7 +83,7 @@ final class MetalDevice implements GpuDeviceBackend {
         );
         MTLCommandQueue.setDebugLabelsEnabled(this.useLabels());
         MTLCommandQueue selectedQueue = this.metalDevice.newCommandQueue(
-                this.metal4Available && this.residencySet != null
+                this.metal4Available && !this.forceMetal3 && this.residencySet != null
         );
         MTL4Compiler selectedCompiler = selectedQueue.isMetal4()
                 ? MTL4Compiler.create(
@@ -196,7 +199,20 @@ final class MetalDevice implements GpuDeviceBackend {
     @Override
     public @NonNull CompiledRenderPipeline precompilePipeline(final @NonNull RenderPipeline pipeline, @Nullable final ShaderSource shaderSource) {
         ShaderSource effectiveSource = shaderSource == null ? this.defaultShaderSource : shaderSource;
-        return this.compiledPipelines.computeIfAbsent(pipeline, p -> MetalCrossShaderCompiler.compile(this, p, effectiveSource));
+        MetalCompiledRenderPipeline cached = this.compiledPipelines.get(pipeline);
+        if (cached != null) {
+            Stats.increment(Stats.Counter.PIPELINE_CACHE_HITS);
+            return cached;
+        }
+        MetalCompiledRenderPipeline compiled = MetalCrossShaderCompiler.compile(this, pipeline, effectiveSource);
+        MetalCompiledRenderPipeline raced = this.compiledPipelines.putIfAbsent(pipeline, compiled);
+        if (raced != null) {
+            compiled.close();
+            Stats.increment(Stats.Counter.PIPELINE_CACHE_HITS);
+            return raced;
+        }
+        Stats.increment(Stats.Counter.PIPELINES_COMPILED);
+        return compiled;
     }
 
     @Override
@@ -204,7 +220,7 @@ final class MetalDevice implements GpuDeviceBackend {
         this.waitForSubmittedGpuWork();
         this.compiledPipelines.values().forEach(MetalCompiledRenderPipeline::close);
         this.compiledPipelines.clear();
-        this.shaderCache.values().forEach(IntermediaryShaderModule::close);
+        this.shaderCache.values().forEach(CachedShaderModule::close);
         this.shaderCache.clear();
         for (MemorySegment function : this.functionCache.values()) {
             if (!ObjC.isNil(function)) {
@@ -248,7 +264,7 @@ final class MetalDevice implements GpuDeviceBackend {
 
     @Override
     public @NonNull GpuQueryPool createTimestampQueryPool(final int size) {
-        return new MetalGpuQueryPool(size);
+        return new MetalGpuQueryPool(this, size);
     }
 
     @Override
@@ -289,7 +305,7 @@ final class MetalDevice implements GpuDeviceBackend {
     }
 
     void queueResourceRelease(final MemorySegment handle) {
-        this.commandEncoder.queueForDestroy(() -> ObjC.release(handle));
+        this.commandEncoder.queueObjCRelease(handle);
     }
 
     void trackAllocation(final MemorySegment handle) {
@@ -299,14 +315,15 @@ final class MetalDevice implements GpuDeviceBackend {
     }
 
     void queueAllocationRelease(final MemorySegment handle) {
-        this.commandEncoder.queueForDestroy(() -> this.releaseAllocationNow(handle));
+        this.commandEncoder.queueAllocationRelease(this, handle);
     }
 
     void releaseAllocationNow(final MemorySegment handle) {
         if (this.residencySet != null) {
-            this.residencySet.removeAllocation(handle);
+            this.residencySet.removeAllocationAndRelease(handle);
+        } else {
+            ObjC.release(handle);
         }
-        ObjC.release(handle);
     }
 
     void commitResidencyChanges() {
@@ -348,23 +365,62 @@ final class MetalDevice implements GpuDeviceBackend {
     }
 
     MetalCompiledRenderPipeline getOrCompilePipeline(final RenderPipeline pipeline) {
-        return this.compiledPipelines.computeIfAbsent(pipeline, p -> MetalCrossShaderCompiler.compile(this, p, this.defaultShaderSource));
+        MetalCompiledRenderPipeline cached = this.compiledPipelines.get(pipeline);
+        if (cached != null) {
+            Stats.increment(Stats.Counter.PIPELINE_CACHE_HITS);
+            return cached;
+        }
+        MetalCompiledRenderPipeline compiled = MetalCrossShaderCompiler.compile(
+                this, pipeline, this.defaultShaderSource);
+        MetalCompiledRenderPipeline raced = this.compiledPipelines.putIfAbsent(pipeline, compiled);
+        if (raced != null) {
+            compiled.close();
+            Stats.increment(Stats.Counter.PIPELINE_CACHE_HITS);
+            return raced;
+        }
+        Stats.increment(Stats.Counter.PIPELINES_COMPILED);
+        return compiled;
     }
 
-    IntermediaryShaderModule getOrCompileShader(final Identifier id, final ShaderType type, final ShaderDefines defines, final ShaderSource shaderSource) {
+    CachedShaderModule getOrCompileShader(final Identifier id, final ShaderType type, final ShaderDefines defines, final ShaderSource shaderSource) {
         ShaderCompilationKey key = new ShaderCompilationKey(id, type, defines);
-        return this.shaderCache.computeIfAbsent(key, k -> {
-            String source = shaderSource.get(k.id(), k.type());
-            if (source == null) {
-                return IntermediaryShaderModule.INVALID;
-            }
-            String sourceWithDefines = prepareShaderSource(source, k.defines());
-            try (GlslCompiler glslCompiler = new GlslCompiler()) {
-                return glslCompiler.createIntermediary(k.id().toDebugFileName(), sourceWithDefines, k.type());
-            } catch (ShaderCompileException e) {
-                throw new IllegalStateException("Failed to compile shader " + k.id(), e);
-            }
-        });
+        CachedShaderModule cached = this.shaderCache.get(key);
+        if (cached != null) {
+            Stats.increment(Stats.Counter.SHADER_CACHE_HITS);
+            return cached;
+        }
+        CachedShaderModule compiled = compileShader(key, shaderSource);
+        CachedShaderModule raced = this.shaderCache.putIfAbsent(key, compiled);
+        if (raced != null) {
+            compiled.close();
+            Stats.increment(Stats.Counter.SHADER_CACHE_HITS);
+            return raced;
+        }
+        Stats.increment(Stats.Counter.SHADERS_COMPILED);
+        return compiled;
+    }
+
+    private CachedShaderModule compileShader(
+            final ShaderCompilationKey key,
+            final ShaderSource shaderSource
+    ) {
+        ShaderCompilationKey k = key;
+        String source = shaderSource.get(k.id(), k.type());
+        if (source == null) {
+            return CachedShaderModule.INVALID;
+        }
+        String sourceWithDefines = prepareShaderSource(source, k.defines());
+        try (GlslCompiler glslCompiler = new GlslCompiler()) {
+            return CachedShaderModule.takeOwnership(
+                    glslCompiler.createIntermediary(
+                            k.id().toDebugFileName(),
+                            sourceWithDefines,
+                            k.type()
+                    )
+            );
+        } catch (ShaderCompileException e) {
+            throw new IllegalStateException("Failed to compile shader " + k.id(), e);
+        }
     }
 
     private static String prepareShaderSource(final String source, final ShaderDefines defines) {
@@ -407,7 +463,11 @@ final class MetalDevice implements GpuDeviceBackend {
         String driverDescription = "macOS " + osVersion
                 + (this.metal4CommandPath
                 ? "; Metal 4"
-                : this.metal4Available ? "; Metal 4 available; Metal 3 command path" : "; Metal 3")
+                : this.metal4Available
+                ? this.forceMetal3
+                    ? "; Metal 4 available; Metal 3 forced by metallum.forceMetal3"
+                    : "; Metal 4 available; Metal 3 command path"
+                : "; Metal 3")
                 + (this.residencySet != null ? "; explicit residency" : "");
         long maxMemoryAllocationSize = Math.min(metalDevice.maxBufferLength(), metalDevice.recommendedMaxWorkingSetSize());
         return new DeviceInfo(

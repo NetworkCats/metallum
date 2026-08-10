@@ -62,6 +62,7 @@ final class MetalGpuTexture extends GpuTexture {
             descriptor.storageMode(MTLStorageMode.Private);
             descriptor.hazardTrackingMode(MTLHazardTrackingMode.Untracked);
             this.nativeHandle = device.metalDevice().newTexture(descriptor);
+            Stats.increment(Stats.Counter.NATIVE_RESOURCES_CREATED);
             device.trackAllocation(this.nativeHandle);
         }
         if (label != null && !label.isEmpty()) {
@@ -145,13 +146,12 @@ final class MetalGpuTexture extends GpuTexture {
 
     private static long toMtlTextureUsage(@GpuTexture.Usage final int usage) {
         long result = 0L;
-        if ((usage & GpuTexture.USAGE_TEXTURE_BINDING) != 0 || (usage & GpuTexture.USAGE_COPY_DST) != 0 || (usage & GpuTexture.USAGE_COPY_SRC) != 0) {
+        if ((usage & GpuTexture.USAGE_TEXTURE_BINDING) != 0) {
             result |= MTLTextureUsage.ShaderRead.value;
         }
         if ((usage & GpuTexture.USAGE_RENDER_ATTACHMENT) != 0) {
             result |= MTLTextureUsage.RenderTarget.value;
-            result |= MTLTextureUsage.ShaderRead.value;
         }
-        return result == 0L ? MTLTextureUsage.ShaderRead.value : result;
+        return result == 0L ? MTLTextureUsage.Unknown.value : result;
     }
 }

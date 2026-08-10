@@ -7,6 +7,12 @@ This project is still experimental. Performance, stability, and compatibility ma
 
 Compatible with Sodium.
 
+### Diagnostic switches
+
+- `-Dmetallum.stats=true` enables low-overhead renderer counters (logged every 600 frames by default).
+- `-Dmetallum.forceMetal3=true` forces the Metal 3 fallback on a Metal 4-capable Mac.
+- `-Dmetallum.resourceTracker=true` enables the Metal 4 range-based synchronization path for validation and benchmarking. Metal 3 currently retains the global-fence fallback.
+
 vibecoded as hell
 
 ## Requirements

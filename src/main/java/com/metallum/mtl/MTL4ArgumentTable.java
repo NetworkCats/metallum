@@ -15,10 +15,10 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
 /** Runtime-only wrapper for the Metal 4 resource-binding table. */
 @Environment(EnvType.CLIENT)
-final class MTL4ArgumentTable implements AutoCloseable {
-    static final int MAX_BUFFERS = 31;
-    static final int MAX_TEXTURES = 128;
-    static final int MAX_SAMPLERS = 16;
+public final class MTL4ArgumentTable implements AutoCloseable {
+    public static final int MAX_BUFFERS = 31;
+    public static final int MAX_TEXTURES = 128;
+    public static final int MAX_SAMPLERS = 16;
 
     private static final MemorySegment DESCRIPTOR_CLASS = ObjC.findClass("MTL4ArgumentTableDescriptor");
     private static final Msg NEW = Msg.of("new", ADDRESS);

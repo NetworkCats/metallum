@@ -2,8 +2,10 @@ package com.metallum.render;
 
 import com.metallum.mtl.MTLBuffer;
 import com.metallum.mtl.MTLHazardTrackingMode;
+import com.metallum.mtl.MTLPixelFormat;
 import com.metallum.mtl.MTLResourceOptions;
 import com.metallum.mtl.MTLStorageMode;
+import com.metallum.mtl.MTLTexture;
 import com.metallum.objc.ObjC;
 import com.mojang.blaze3d.buffers.GpuBuffer;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
@@ -15,6 +17,8 @@ import org.jspecify.annotations.Nullable;
 import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.HashMap;
+import java.util.Map;
 
 @Environment(EnvType.CLIENT)
 class MetalGpuBuffer extends GpuBuffer {
@@ -28,6 +32,10 @@ class MetalGpuBuffer extends GpuBuffer {
     @Nullable
     private ByteBuffer storage;
     private boolean closed;
+    private long backingGeneration;
+    private final Map<TexelViewKey, MemorySegment> texelViews = new HashMap<>();
+    private long writableSubmit = -1L;
+    private boolean backingUsedByGpu;
 
     MetalGpuBuffer(final MetalDevice device, @GpuBuffer.Usage final int usage, final long size) {
         super(usage, size);
@@ -38,6 +46,7 @@ class MetalGpuBuffer extends GpuBuffer {
         this.resourceOptions = toMtlResourceOptions(usage);
         this.allocationSize = (size + 15L) & ~15L;
         this.nativeBuffer = device.metalDevice().newBuffer(this.allocationSize, this.resourceOptions);
+        Stats.increment(Stats.Counter.NATIVE_RESOURCES_CREATED);
         device.trackAllocation(this.nativeBuffer.handle());
 
         if (this.cpuAccessible) {
@@ -107,9 +116,56 @@ class MetalGpuBuffer extends GpuBuffer {
         return this.storage.duplicate().order(this.storage.order());
     }
 
-    void swapBacking(final MTLBuffer buffer, final ByteBuffer storage) {
+    void swapBacking(final MTLBuffer buffer, final ByteBuffer storage, final long submitIndex) {
+        releaseTexelViews();
         this.nativeBuffer = buffer;
         this.storage = storage;
+        this.backingGeneration++;
+        this.writableSubmit = submitIndex;
+        this.backingUsedByGpu = false;
+    }
+
+    boolean canUpdateBackingInPlace(final long submitIndex) {
+        return this.writableSubmit == submitIndex && !this.backingUsedByGpu;
+    }
+
+    void markGpuUse(final long submitIndex) {
+        if (this.writableSubmit == submitIndex) {
+            this.backingUsedByGpu = true;
+        }
+    }
+
+    MemorySegment texelTextureView(
+            final MTLPixelFormat format,
+            final long offset,
+            final long byteLength,
+            final int pixelSize
+    ) {
+        if (byteLength <= 0L || byteLength % pixelSize != 0L) {
+            return MemorySegment.NULL;
+        }
+        TexelViewKey key = new TexelViewKey(
+                this.backingGeneration,
+                format.value,
+                offset,
+                byteLength
+        );
+        MemorySegment cached = this.texelViews.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        MemorySegment created = MTLTexture.newBufferTextureView(
+                nativeHandle(),
+                format.value,
+                offset,
+                byteLength / pixelSize,
+                byteLength
+        );
+        if (!ObjC.isNil(created)) {
+            this.texelViews.put(key, created);
+            Stats.increment(Stats.Counter.NATIVE_RESOURCES_CREATED);
+        }
+        return created;
     }
 
     @Override
@@ -124,6 +180,8 @@ class MetalGpuBuffer extends GpuBuffer {
         }
         this.closed = true;
         this.storage = null;
+        this.backingUsedByGpu = true;
+        releaseTexelViews();
         if (this.nativeBuffer != null) {
             MemorySegment handle = this.nativeBuffer.handle();
             this.nativeBuffer = null;
@@ -167,5 +225,18 @@ class MetalGpuBuffer extends GpuBuffer {
     private static long toMtlResourceOptions(@GpuBuffer.Usage final int usage) {
         MTLStorageMode storageMode = isCpuAccessible(usage) || isDynamic(usage) ? MTLStorageMode.Shared : MTLStorageMode.Private;
         return MTLResourceOptions.of(storageMode, MTLHazardTrackingMode.Untracked);
+    }
+
+    private void releaseTexelViews() {
+        if (this.texelViews.isEmpty()) {
+            return;
+        }
+        for (MemorySegment view : this.texelViews.values()) {
+            this.device.queueResourceRelease(view);
+        }
+        this.texelViews.clear();
+    }
+
+    private record TexelViewKey(long generation, long format, long offset, long length) {
     }
 }

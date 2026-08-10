@@ -7,8 +7,6 @@ import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.buffers.GpuBufferSlice.MappedView;
 import com.mojang.blaze3d.systems.TransientMemory;
 import com.mojang.blaze3d.util.TransientBlockAllocator;
-import it.unimi.dsi.fastutil.ints.IntArrayList;
-import it.unimi.dsi.fastutil.ints.IntComparator;
 import it.unimi.dsi.fastutil.objects.ReferenceArrayList;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
@@ -18,7 +16,6 @@ import org.lwjgl.system.MemoryUtil;
 
 import java.nio.ByteBuffer;
 import java.util.List;
-import java.util.stream.IntStream;
 
 @Environment(EnvType.CLIENT)
 final class MetalTransientMemory implements TransientMemory {
@@ -34,6 +31,7 @@ final class MetalTransientMemory implements TransientMemory {
     );
     private final TransientBlockAllocator<MetalGpuBuffer> gpuBlockAllocator;
     private long submitIndex = 0L;
+    private long frameAllocatedBytes;
 
     MetalTransientMemory(final MetalDevice device, final MetalCommandEncoder encoder) {
         this.device = device;
@@ -44,6 +42,12 @@ final class MetalTransientMemory implements TransientMemory {
     }
 
     void rotate() {
+        Stats.recordHighWater(Stats.Counter.TRANSIENT_HIGH_WATER_BYTES, this.frameAllocatedBytes);
+        Stats.recordHighWater(
+                Stats.Counter.TRANSIENT_BLOCKS,
+                (this.frameAllocatedBytes + BLOCK_SIZE - 1L) / BLOCK_SIZE
+        );
+        this.frameAllocatedBytes = 0L;
         cpuBlockAllocator.rotate().run();
         encoder.queueForDestroy(gpuBlockAllocator.rotate());
         submitIndex++;
@@ -64,6 +68,7 @@ final class MetalTransientMemory implements TransientMemory {
 
     @Override
     public @NonNull ByteBuffer allocateCpu(final long size, final long alignment, final long minimumAllocation, final long elementSize) {
+        recordAllocation(size);
         TransientBlockAllocator.Allocation<Long> alloc = cpuBlockAllocator.allocate(size, alignment, minimumAllocation, elementSize);
         return MemoryUtil.memByteBuffer(alloc.block() + alloc.offset(), (int) alloc.size());
     }
@@ -75,6 +80,7 @@ final class MetalTransientMemory implements TransientMemory {
 
     @Override
     public @NonNull GpuBufferSlice allocateGpu(final long size, final long alignment, @Usage final int usage, final long minimumAllocation, final long elementSize) {
+        recordAllocation(size);
         TransientBlockAllocator.Allocation<MetalGpuBuffer> alloc = gpuBlockAllocator.allocate(size, alignment, minimumAllocation, elementSize);
         return new GpuBufferSlice(wrap(alloc.block(), usage), alloc.offset(), alloc.size());
     }
@@ -85,6 +91,7 @@ final class MetalTransientMemory implements TransientMemory {
     }
 
     private MappedView allocateMapped(final long size, final long alignment, @Usage final int usage, final long minimumAllocation, final long elementSize) {
+        recordAllocation(size);
         TransientBlockAllocator.Allocation<MetalGpuBuffer> alloc = gpuBlockAllocator.allocate(size, alignment, minimumAllocation, elementSize);
         GpuBufferSlice slice = new GpuBufferSlice(wrap(alloc.block(), usage), alloc.offset(), alloc.size());
         ByteBuffer hostView = alloc.block().sliceStorage(alloc.offset(), alloc.size());
@@ -112,6 +119,7 @@ final class MetalTransientMemory implements TransientMemory {
             totalSize += buffer.remaining();
             totalSize = Mth.roundToward(totalSize, alignment);
         }
+        Stats.add(Stats.Counter.UPLOAD_BYTES, totalSize);
 
         GpuBufferSlice result;
         try (MappedView mapped = allocateMapped(totalSize, alignment, usage, minimumAllocation, elementSize)) {
@@ -141,39 +149,22 @@ final class MetalTransientMemory implements TransientMemory {
     }
 
     private List<GpuBufferSlice> multiUpload(final List<ByteBuffer> data, final long alignment, @Usage final int usage) {
-        ReferenceArrayList<GpuBufferSlice> uploaded = new ReferenceArrayList<>();
-        uploaded.size(data.size());
-        IntArrayList sortedIndices = IntArrayList.toList(IntStream.range(0, data.size()));
-        sortedIndices.sort(IntComparator.comparingInt(index -> data.get(index).remaining()));
-
-        while (!sortedIndices.isEmpty()) {
-            boolean allocatedAnything = false;
-
-            for (int i = sortedIndices.size() - 1; i >= 0; i--) {
-                int bufferIndex = sortedIndices.getInt(i);
-                ByteBuffer currentBuffer = data.get(bufferIndex);
-                if (gpuBlockAllocator.canAllocateInCurrentBlock(currentBuffer.remaining(), alignment)) {
-                    sortedIndices.removeInt(i);
-                    try (MappedView view = allocateGpuMapped(currentBuffer.remaining(), alignment, usage)) {
-                        MemoryUtil.memCopy(currentBuffer, view.data());
-                        uploaded.set(bufferIndex, view.slice());
-                    }
-                    allocatedAnything = true;
-                    break;
-                }
+        ReferenceArrayList<GpuBufferSlice> uploaded = new ReferenceArrayList<>(data.size());
+        long uploadedBytes = 0L;
+        for (ByteBuffer currentBuffer : data) {
+            int length = currentBuffer.remaining();
+            try (MappedView view = allocateGpuMapped(length, alignment, usage)) {
+                MemoryUtil.memCopy(currentBuffer, view.data());
+                uploaded.add(view.slice());
             }
-
-            if (!allocatedAnything) {
-                int bufferIndex = sortedIndices.popInt();
-                ByteBuffer currentBuffer = data.get(bufferIndex);
-                try (MappedView view = allocateGpuMapped(currentBuffer.remaining(), alignment, usage)) {
-                    MemoryUtil.memCopy(currentBuffer, view.data());
-                    uploaded.set(bufferIndex, view.slice());
-                }
-            }
+            uploadedBytes += length;
         }
-
+        Stats.add(Stats.Counter.UPLOAD_BYTES, uploadedBytes);
         return uploaded;
+    }
+
+    private void recordAllocation(final long size) {
+        this.frameAllocatedBytes = Math.addExact(this.frameAllocatedBytes, Math.max(size, 0L));
     }
 
     private static final class TransientGpuBuffer extends MetalGpuBuffer {

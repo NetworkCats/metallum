@@ -2,6 +2,7 @@ package com.metallum.mtl;
 
 import com.metallum.objc.AutoreleasePool;
 import com.metallum.objc.ObjC;
+import com.metallum.render.Stats;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import org.joml.Vector4fc;
@@ -250,6 +251,8 @@ public final class MTLBuiltinPipelines {
 
             if (globalFence != null) {
                 encoder.waitForFence(globalFence, MTLRenderStages.Fragment);
+            } else if (commandBuffer.isMetal4()) {
+                encoder.barrierAfterQueueStages(Long.MAX_VALUE, MTLRenderStages.Fragment.value, true);
             }
 
             if (!fullRegion) {
@@ -283,7 +286,11 @@ public final class MTLBuiltinPipelines {
             final MTLFence globalFence
     ) {
         try (AutoreleasePool _ = AutoreleasePool.push()) {
+            long drawableStart = Stats.enabled() ? System.nanoTime() : 0L;
             CAMetalDrawable drawable = layer.nextDrawable();
+            if (Stats.enabled()) {
+                Stats.add(Stats.Counter.NEXT_DRAWABLE_WAIT_NANOS, System.nanoTime() - drawableStart);
+            }
             if (drawable == null) {
                 return;
             }
@@ -303,6 +310,8 @@ public final class MTLBuiltinPipelines {
 
             if (globalFence != null) {
                 encoder.waitForFence(globalFence, MTLRenderStages.Fragment);
+            } else if (commandBuffer.isMetal4()) {
+                encoder.barrierAfterQueueStages(Long.MAX_VALUE, MTLRenderStages.Fragment.value, true);
             }
 
             long drawableWidth = MTLTexture.width(drawableTexture);
@@ -468,9 +477,10 @@ public final class MTLBuiltinPipelines {
             return;
         }
         if (residencySet != null) {
-            residencySet.removeAllocation(pipeline);
+            residencySet.removeAllocationAndRelease(pipeline);
+        } else {
+            ObjC.release(pipeline);
         }
-        ObjC.release(pipeline);
     }
 
     private record BuiltinFunctionKey(String mslSource, String entryPoint) {

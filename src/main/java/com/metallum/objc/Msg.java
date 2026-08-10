@@ -102,9 +102,33 @@ public record Msg(String name, MemorySegment sel, MethodHandle handle) {
         }
     }
 
+    public void send(MemorySegment self, MemorySegment a, MemorySegment b) {
+        try {
+            handle.invokeExact(self, sel, a, b);
+        } catch (Throwable throwable) {
+            throw fail(throwable);
+        }
+    }
+
+    public void send(MemorySegment self, MemorySegment a, long b, boolean c) {
+        try {
+            handle.invokeExact(self, sel, a, b, c);
+        } catch (Throwable throwable) {
+            throw fail(throwable);
+        }
+    }
+
     public void send(MemorySegment self, long a, MemorySegment b, long c) {
         try {
             handle.invokeExact(self, sel, a, b, c);
+        } catch (Throwable throwable) {
+            throw fail(throwable);
+        }
+    }
+
+    public void send(MemorySegment self, long a, long b, MemorySegment c, long d) {
+        try {
+            handle.invokeExact(self, sel, a, b, c, d);
         } catch (Throwable throwable) {
             throw fail(throwable);
         }
@@ -233,6 +257,14 @@ public record Msg(String name, MemorySegment sel, MethodHandle handle) {
     public long sendLong(MemorySegment self, long a) {
         try {
             return (long) handle.invokeExact(self, sel, a);
+        } catch (Throwable throwable) {
+            throw fail(throwable);
+        }
+    }
+
+    public boolean sendBoolean(MemorySegment self, long a) {
+        try {
+            return (boolean) handle.invokeExact(self, sel, a);
         } catch (Throwable throwable) {
             throw fail(throwable);
         }

@@ -7,8 +7,11 @@ import com.metallum.objc.ObjC;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import org.jspecify.annotations.Nullable;
+import org.lwjgl.system.MemoryStack;
 
 import java.lang.foreign.MemorySegment;
+import java.util.ArrayList;
+import java.util.List;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
@@ -28,15 +31,23 @@ public final class MTLResidencySet implements AutoCloseable {
     private static final Msg SET_INITIAL_CAPACITY = Msg.ofVoid("setInitialCapacity:", JAVA_LONG);
     private static final Msg CREATE = Msg.of(CREATE_SELECTOR, ADDRESS, ADDRESS, ADDRESS);
     private static final Msg ADD_ALLOCATION = Msg.ofVoid("addAllocation:", ADDRESS);
+    private static final Msg ADD_ALLOCATIONS = Msg.ofVoid("addAllocations:count:", ADDRESS, JAVA_LONG);
     private static final Msg REMOVE_ALLOCATION = Msg.ofVoid("removeAllocation:", ADDRESS);
+    private static final Msg REMOVE_ALLOCATIONS = Msg.ofVoid("removeAllocations:count:", ADDRESS, JAVA_LONG);
     private static final Msg REMOVE_ALL_ALLOCATIONS = Msg.ofVoid("removeAllAllocations");
     private static final Msg COMMIT = Msg.ofVoid("commit");
 
     private MemorySegment handle;
     private boolean dirty;
+    private final boolean supportsBatchOperations;
+    private final List<MemorySegment> pendingAdds = new ArrayList<>();
+    private final List<MemorySegment> pendingRemoves = new ArrayList<>();
+    private final List<MemorySegment> releasesAfterCommit = new ArrayList<>();
 
     private MTLResidencySet(final MemorySegment handle) {
         this.handle = handle;
+        this.supportsBatchOperations = ObjC.respondsToSelector(handle, "addAllocations:count:")
+                && ObjC.respondsToSelector(handle, "removeAllocations:count:");
     }
 
     @Nullable
@@ -91,7 +102,7 @@ public final class MTLResidencySet implements AutoCloseable {
         if (ObjC.isNil(allocation) || ObjC.isNil(this.handle)) {
             return;
         }
-        ADD_ALLOCATION.send(this.handle, allocation);
+        this.pendingAdds.add(allocation);
         this.dirty = true;
     }
 
@@ -99,7 +110,16 @@ public final class MTLResidencySet implements AutoCloseable {
         if (ObjC.isNil(allocation) || ObjC.isNil(this.handle)) {
             return;
         }
-        REMOVE_ALLOCATION.send(this.handle, allocation);
+        this.pendingRemoves.add(allocation);
+        this.dirty = true;
+    }
+
+    public synchronized void removeAllocationAndRelease(final MemorySegment allocation) {
+        if (ObjC.isNil(allocation) || ObjC.isNil(this.handle)) {
+            return;
+        }
+        this.pendingRemoves.add(allocation);
+        this.releasesAfterCommit.add(allocation);
         this.dirty = true;
     }
 
@@ -107,7 +127,10 @@ public final class MTLResidencySet implements AutoCloseable {
         if (!this.dirty || ObjC.isNil(this.handle)) {
             return;
         }
+        flushPending(this.pendingAdds, ADD_ALLOCATIONS, ADD_ALLOCATION);
+        flushPending(this.pendingRemoves, REMOVE_ALLOCATIONS, REMOVE_ALLOCATION);
         COMMIT.send(this.handle);
+        releaseCommittedAllocations();
         this.dirty = false;
     }
 
@@ -118,8 +141,45 @@ public final class MTLResidencySet implements AutoCloseable {
         }
         REMOVE_ALL_ALLOCATIONS.send(this.handle);
         COMMIT.send(this.handle);
+        releaseCommittedAllocations();
+        this.pendingAdds.clear();
+        this.pendingRemoves.clear();
         ObjC.release(this.handle);
         this.handle = MemorySegment.NULL;
         this.dirty = false;
+    }
+
+    private void releaseCommittedAllocations() {
+        for (MemorySegment allocation : this.releasesAfterCommit) {
+            ObjC.release(allocation);
+        }
+        this.releasesAfterCommit.clear();
+    }
+
+    private void flushPending(
+            final List<MemorySegment> pending,
+            final Msg batchMessage,
+            final Msg singleMessage
+    ) {
+        if (pending.isEmpty()) {
+            return;
+        }
+        if (this.supportsBatchOperations) {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                int byteSize = Math.multiplyExact(pending.size(), Long.BYTES);
+                MemorySegment allocations = MemorySegment.ofAddress(
+                        stack.nmalloc(Long.BYTES, byteSize)
+                ).reinterpret(byteSize);
+                for (int i = 0; i < pending.size(); i++) {
+                    allocations.setAtIndex(ADDRESS, i, pending.get(i));
+                }
+                batchMessage.send(this.handle, allocations, (long) pending.size());
+            }
+        } else {
+            for (MemorySegment allocation : pending) {
+                singleMessage.send(this.handle, allocation);
+            }
+        }
+        pending.clear();
     }
 }

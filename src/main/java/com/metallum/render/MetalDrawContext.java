@@ -1,16 +1,12 @@
 package com.metallum.render;
 
-import com.mojang.blaze3d.buffers.GpuBuffer;
-import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.pipeline.RenderPipeline;
 import com.mojang.blaze3d.systems.RenderPass;
-import net.caffeinemc.mods.sodium.client.gpu.device.context.VKIndirectContext;
+import net.caffeinemc.mods.sodium.client.gpu.device.context.DrawContext;
 import net.caffeinemc.mods.sodium.client.render.chunk.region.RenderRegion;
 import net.caffeinemc.mods.sodium.client.render.viewport.CameraTransform;
 
-import java.nio.ByteBuffer;
-
-public final class MetalDrawContext extends VKIndirectContext {
+public final class MetalDrawContext extends DrawContext {
     private MetalRenderPass metalPass;
 
     @Override
@@ -25,17 +21,34 @@ public final class MetalDrawContext extends VKIndirectContext {
         float y = getCameraTranslation(region.getOriginY(), camera.intY, camera.fracY);
         float z = getCameraTranslation(region.getOriginZ(), camera.intZ, camera.fracZ);
 
-        GpuBufferSlice pushConstantsBufferSlice;
-        try (GpuBufferSlice.MappedView mapped = metalPass.allocateTransient(20, 4, GpuBuffer.USAGE_UNIFORM)) {
-            ByteBuffer data = mapped.data();
-            data.putFloat(0, x);
-            data.putFloat(4, y);
-            data.putFloat(8, z);
-            data.putInt(12, Math.toIntExact(System.currentTimeMillis() - region.getCreationTime()));
-            data.putInt(16, region.getId());
-            pushConstantsBufferSlice = mapped.slice();
-        }
+        this.metalPass.setSodiumPushConstants(
+                x,
+                y,
+                z,
+                Math.toIntExact(System.currentTimeMillis() - region.getCreationTime()),
+                region.getId()
+        );
+    }
 
-        this.metalPass.setUniform("push_constants", pushConstantsBufferSlice);
+    void draw(final MetalIndirectDrawBatch batch) {
+        if (this.metalPass == null) {
+            throw new IllegalStateException("Sodium draw context has no active render pass");
+        }
+        this.metalPass.drawBatch(batch);
+    }
+
+    @Override
+    public void rotate() {
+        // ICB batches own their command storage and need no per-frame upload ring.
+    }
+
+    @Override
+    public void delete() {
+        this.metalPass = null;
+        this.pass = null;
+    }
+
+    @Override
+    public void endDraw() {
     }
 }

@@ -39,6 +39,7 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
     private final List<ResourceBinding> resources;
     private final MetalDevice device;
     private final Map<String, ResourceBinding> resourcesByName;
+    private final Map<String, Integer> resourceSlotsByName;
     private final long allResourceMask;
     private final int firstAvailableVertexBufferSlot;
     private final MTLCullMode cullMode;
@@ -64,23 +65,33 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
         this.device = device;
         this.resources = resources;
         this.resourcesByName = resources.stream().collect(java.util.stream.Collectors.toUnmodifiableMap(ResourceBinding::name, binding -> binding));
-
-        int maxBindingIndex = -1;
-        long resourceMask = 0L;
-        for (ResourceBinding binding : resources) {
-            maxBindingIndex = Math.max(maxBindingIndex, binding.bindingIndex());
-            resourceMask |= 1L << binding.bindingIndex();
+        if (resources.size() > Long.SIZE) {
+            throw new IllegalStateException("Pipeline " + info.getLocation() + " has " + resources.size()
+                    + " resources; the Metal backend limit is " + Long.SIZE);
         }
-        if (maxBindingIndex >= Long.SIZE) {
-            throw new IllegalStateException("Pipeline " + info.getLocation() + " has binding index " + maxBindingIndex + ", limit is " + (Long.SIZE - 1));
+        Map<String, Integer> slots = new java.util.HashMap<>(resources.size());
+        for (int slot = 0; slot < resources.size(); slot++) {
+            ResourceBinding binding = resources.get(slot);
+            slots.put(binding.name(), slot);
+            validateBindingIndex(info, binding);
         }
-        this.allResourceMask = resourceMask;
+        this.resourceSlotsByName = Map.copyOf(slots);
+        this.allResourceMask = resources.size() == Long.SIZE
+                ? -1L
+                : (1L << resources.size()) - 1L;
 
         this.firstAvailableVertexBufferSlot = firstAvailableVertexBufferSlot(resources);
         this.cullMode = info.isCull() ? MTLCullMode.Back : MTLCullMode.None;
         this.fillMode = info.getPolygonMode() == PolygonMode.WIREFRAME ? MTLTriangleFillMode.Lines : MTLTriangleFillMode.Fill;
         this.topology = MTLPrimitiveType.from(info.getPrimitiveTopology());
         this.vertexBufferCount = info.getVertexFormatBindings().length;
+        if (this.firstAvailableVertexBufferSlot + this.vertexBufferCount
+                > MTL4ArgumentTable.MAX_BUFFERS) {
+            throw new IllegalStateException("Pipeline " + info.getLocation()
+                    + " needs " + this.vertexBufferCount + " vertex buffers starting at Metal slot "
+                    + this.firstAvailableVertexBufferSlot + ", but only "
+                    + MTL4ArgumentTable.MAX_BUFFERS + " buffer slots exist");
+        }
 
         MTLCompareFunction depthCompareOp;
         int depthWrite;
@@ -161,6 +172,7 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
             descriptor.setVertexDescriptor(vertexDescriptor);
             descriptor.setColorAttachmentFormat(0, colorFormat.value);
             descriptor.setInputPrimitiveTopology(topologyClass(topology));
+            descriptor.setSupportIndirectCommandBuffers(true);
 
             if (blendFunction.isPresent()) {
                 BlendFunction function = blendFunction.get();
@@ -210,6 +222,7 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
             pipelineDesc.setVertexDescriptor(vertexDescriptor);
             pipelineDesc.setColorAttachmentFormat(0, colorFormat);
             pipelineDesc.setDepthStencilFormats(depthFormat, MTLPixelFormat.Invalid);
+            pipelineDesc.setSupportIndirectCommandBuffers(true);
 
             if (blendFunction.isPresent()) {
                 var function = blendFunction.get();
@@ -253,6 +266,10 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
     @Nullable
     ResourceBinding resource(final String name) {
         return this.resourcesByName.get(name);
+    }
+
+    int resourceSlot(final String name) {
+        return this.resourceSlotsByName.getOrDefault(name, -1);
     }
 
     int firstAvailableVertexBufferSlot() {
@@ -333,6 +350,26 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
             }
         }
         return maxVertexBufferBinding + 1;
+    }
+
+    private static void validateBindingIndex(
+            final RenderPipeline pipeline,
+            final ResourceBinding binding
+    ) {
+        int limit = switch (binding.kind()) {
+            case UNIFORM_BUFFER -> MTL4ArgumentTable.MAX_BUFFERS;
+            case TEXEL_BUFFER -> MTL4ArgumentTable.MAX_TEXTURES;
+            case SAMPLED_IMAGE -> Math.min(
+                    MTL4ArgumentTable.MAX_TEXTURES,
+                    MTL4ArgumentTable.MAX_SAMPLERS
+            );
+        };
+        if (binding.bindingIndex() < 0 || binding.bindingIndex() >= limit) {
+            throw new IllegalStateException("Pipeline " + pipeline.getLocation() + " "
+                    + binding.kind().name().toLowerCase(java.util.Locale.ROOT) + " binding "
+                    + binding.name() + " uses index " + binding.bindingIndex()
+                    + ", but Metal allows indices below " + limit);
+        }
     }
 
     private static long topologyClass(final MTLPrimitiveType topology) {

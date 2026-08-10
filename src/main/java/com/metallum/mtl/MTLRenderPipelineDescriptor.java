@@ -27,6 +27,8 @@ public final class MTLRenderPipelineDescriptor implements AutoCloseable {
     private static final Msg SET_SOURCE_ALPHA_BLEND_FACTOR = Msg.ofVoid("setSourceAlphaBlendFactor:", JAVA_LONG);
     private static final Msg SET_DESTINATION_ALPHA_BLEND_FACTOR = Msg.ofVoid("setDestinationAlphaBlendFactor:", JAVA_LONG);
     private static final Msg SET_ALPHA_BLEND_OPERATION = Msg.ofVoid("setAlphaBlendOperation:", JAVA_LONG);
+    private static final Msg SET_SUPPORT_ICB =
+            Msg.ofVoid("setSupportIndirectCommandBuffers:", JAVA_BOOLEAN);
 
     private final MemorySegment handle;
     private boolean closed;
@@ -46,6 +48,10 @@ public final class MTLRenderPipelineDescriptor implements AutoCloseable {
 
     public void setVertexDescriptor(final MTLVertexDescriptor vertexDescriptor) {
         SET_VERTEX_DESCRIPTOR.send(this.handle, vertexDescriptor.handle());
+    }
+
+    public void setSupportIndirectCommandBuffers(final boolean enabled) {
+        SET_SUPPORT_ICB.send(this.handle, enabled);
     }
 
     public void setColorAttachmentFormat(final long index, final MTLPixelFormat format) {

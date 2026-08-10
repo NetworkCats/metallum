@@ -38,6 +38,8 @@ public final class MTL4RenderPipelineDescriptor implements AutoCloseable {
     private static final Msg SET_ALPHA_BLEND_OPERATION = Msg.ofVoid("setAlphaBlendOperation:", JAVA_LONG);
     private static final Msg SET_INPUT_PRIMITIVE_TOPOLOGY =
             Msg.ofVoid("setInputPrimitiveTopology:", JAVA_LONG);
+    private static final Msg SET_SUPPORT_ICB =
+            Msg.ofVoid("setSupportIndirectCommandBuffers:", JAVA_LONG);
 
     private MemorySegment handle;
 
@@ -85,6 +87,10 @@ public final class MTL4RenderPipelineDescriptor implements AutoCloseable {
 
     public void setInputPrimitiveTopology(final long topologyClass) {
         SET_INPUT_PRIMITIVE_TOPOLOGY.send(handle(), topologyClass);
+    }
+
+    public void setSupportIndirectCommandBuffers(final boolean enabled) {
+        SET_SUPPORT_ICB.send(handle(), enabled ? 1L : 0L);
     }
 
     public void setBlendState(

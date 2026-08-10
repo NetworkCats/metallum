@@ -42,51 +42,55 @@ final class MetalCrossShaderCompiler {
 
     static MetalCompiledRenderPipeline compile(final MetalDevice device, final RenderPipeline pipeline, final ShaderSource shaderSource) {
         try {
-            IntermediaryShaderModule vertexSpirv = device.getOrCompileShader(pipeline.getVertexShader(), ShaderType.VERTEX, pipeline.getShaderDefines(), shaderSource);
-            IntermediaryShaderModule fragmentSpirv = device.getOrCompileShader(pipeline.getFragmentShader(), ShaderType.FRAGMENT, pipeline.getShaderDefines(), shaderSource);
-            if (vertexSpirv == IntermediaryShaderModule.INVALID || fragmentSpirv == IntermediaryShaderModule.INVALID) {
+            CachedShaderModule cachedVertex = device.getOrCompileShader(pipeline.getVertexShader(), ShaderType.VERTEX, pipeline.getShaderDefines(), shaderSource);
+            CachedShaderModule cachedFragment = device.getOrCompileShader(pipeline.getFragmentShader(), ShaderType.FRAGMENT, pipeline.getShaderDefines(), shaderSource);
+            if (!cachedVertex.isValid() || !cachedFragment.isValid()) {
                 throw new IllegalStateException(
                         "Couldn't compile shader for pipeline " + pipeline.getLocation()
                 );
             }
 
-            List<VulkanBindGroupLayout.Entry> layoutEntries = new ArrayList<>();
-            addToBindGroup(layoutEntries, vertexSpirv, pipeline);
-            addToBindGroup(layoutEntries, fragmentSpirv, pipeline);
-            List<String> vertexOutputs = extractVariableNames(vertexSpirv.outputs());
+            try (IntermediaryShaderModule vertexSpirv = cachedVertex.instantiate();
+                 IntermediaryShaderModule fragmentSpirv = cachedFragment.instantiate()) {
 
-            vertexSpirv.rebind(tolerateUnprovidedInputs(MetalPipelineSupport.vertexAttributeNames(pipeline), vertexSpirv.inputs()), layoutEntries);
-            int mslVersion = device.usesMetal4CommandPath() ? MSL_VERSION_4_0 : MSL_VERSION_3_0;
-            MslShader vertexMsl = spirvToMsl(
-                    vertexSpirv.spirv(),
-                    layoutEntries.size(),
-                    vertexAttributeFormats(pipeline),
-                    true,
-                    mslVersion
-            );
+                List<VulkanBindGroupLayout.Entry> layoutEntries = new ArrayList<>();
+                addToBindGroup(layoutEntries, vertexSpirv, pipeline);
+                addToBindGroup(layoutEntries, fragmentSpirv, pipeline);
+                List<String> vertexOutputs = extractVariableNames(vertexSpirv.outputs());
 
-            boolean enableFragDepth = pipeline.getDepthStencilState() != null;
-            fragmentSpirv.rebind(tolerateUnprovidedInputs(vertexOutputs, fragmentSpirv.inputs()), layoutEntries);
-            MslShader fragmentMsl = spirvToMsl(
-                    fragmentSpirv.spirv(),
-                    layoutEntries.size(),
-                    Map.of(),
-                    enableFragDepth,
-                    mslVersion
-            );
+                vertexSpirv.rebind(tolerateUnprovidedInputs(MetalPipelineSupport.vertexAttributeNames(pipeline), vertexSpirv.inputs()), layoutEntries);
+                int mslVersion = device.usesMetal4CommandPath() ? MSL_VERSION_4_0 : MSL_VERSION_3_0;
+                MslShader vertexMsl = spirvToMsl(
+                        vertexSpirv.spirv(),
+                        layoutEntries.size(),
+                        vertexAttributeFormats(pipeline),
+                        true,
+                        mslVersion
+                );
 
-            String vertexEntryPoint = extractEntryPoint(vertexMsl.source(), VERTEX_ENTRY_PATTERN, "main0");
-            String fragmentEntryPoint = extractEntryPoint(fragmentMsl.source(), FRAGMENT_ENTRY_PATTERN, "main0");
-            List<MetalCompiledRenderPipeline.ResourceBinding> resources = buildResourceBindings(layoutEntries, vertexMsl, fragmentMsl);
-            return new MetalCompiledRenderPipeline(
-                    device,
-                    pipeline,
-                    vertexMsl.source(),
-                    fragmentMsl.source(),
-                    vertexEntryPoint,
-                    fragmentEntryPoint,
-                    resources
-            );
+                boolean enableFragDepth = pipeline.getDepthStencilState() != null;
+                fragmentSpirv.rebind(tolerateUnprovidedInputs(vertexOutputs, fragmentSpirv.inputs()), layoutEntries);
+                MslShader fragmentMsl = spirvToMsl(
+                        fragmentSpirv.spirv(),
+                        layoutEntries.size(),
+                        Map.of(),
+                        enableFragDepth,
+                        mslVersion
+                );
+
+                String vertexEntryPoint = extractEntryPoint(vertexMsl.source(), VERTEX_ENTRY_PATTERN, "main0");
+                String fragmentEntryPoint = extractEntryPoint(fragmentMsl.source(), FRAGMENT_ENTRY_PATTERN, "main0");
+                List<MetalCompiledRenderPipeline.ResourceBinding> resources = buildResourceBindings(layoutEntries, vertexMsl, fragmentMsl);
+                return new MetalCompiledRenderPipeline(
+                        device,
+                        pipeline,
+                        vertexMsl.source(),
+                        fragmentMsl.source(),
+                        vertexEntryPoint,
+                        fragmentEntryPoint,
+                        resources
+                );
+            }
         } catch (ShaderCompileException e) {
             throw new IllegalStateException("Failed to compile Metal cross shader for pipeline " + pipeline.getLocation(), e);
         }

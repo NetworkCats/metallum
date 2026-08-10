@@ -2,6 +2,7 @@ package com.metallum.mtl;
 
 import com.metallum.objc.Msg;
 import com.metallum.objc.ObjC;
+import com.metallum.render.Stats;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import org.joml.Vector4fc;
@@ -9,11 +10,14 @@ import org.jspecify.annotations.Nullable;
 import org.lwjgl.system.MemoryStack;
 
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.MemoryLayout;
+import java.util.Arrays;
 
 import static java.lang.foreign.ValueLayout.*;
 
 @Environment(EnvType.CLIENT)
 public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
+    private static final MemoryLayout NS_RANGE = MemoryLayout.structLayout(JAVA_LONG, JAVA_LONG);
     private static final Msg SET_RENDER_PIPELINE_STATE = Msg.ofVoid("setRenderPipelineState:", ADDRESS);
     private static final Msg SET_DEPTH_STENCIL_STATE = Msg.ofVoid("setDepthStencilState:", ADDRESS);
     private static final Msg SET_DEPTH_BIAS = Msg.ofVoid("setDepthBias:slopeScale:clamp:", JAVA_FLOAT, JAVA_FLOAT, JAVA_FLOAT);
@@ -54,12 +58,32 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
             JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG);
     private static final Msg MTL4_DRAW_INDIRECT = Msg.ofVoid(
             "drawPrimitives:indirectBuffer:", JAVA_LONG, JAVA_LONG);
+    private static final Msg SAMPLE_COUNTERS = Msg.ofVoid(
+            "sampleCountersInBuffer:atSampleIndex:withBarrier:", ADDRESS, JAVA_LONG, JAVA_BOOLEAN);
+    private static final Msg MTL4_WRITE_TIMESTAMP = Msg.ofVoid(
+            "writeTimestampWithGranularity:afterStage:intoHeap:atIndex:",
+            JAVA_LONG, JAVA_LONG, ADDRESS, JAVA_LONG);
+    private static final Msg EXECUTE_ICB = Msg.ofVoid(
+            "executeCommandsInBuffer:withRange:", ADDRESS, NS_RANGE);
+    private static final Msg USE_RESOURCE = Msg.ofVoid(
+            "useResource:usage:stages:", ADDRESS, JAVA_LONG, JAVA_LONG);
 
     @Nullable
     private final MTL4ArgumentTable argumentTable;
     @Nullable
     private final MTLCommandBuffer commandBuffer;
     private final long[] bufferBaseAddresses = new long[MTL4ArgumentTable.MAX_BUFFERS];
+    private final long[] metal4BufferAddresses = new long[MTL4ArgumentTable.MAX_BUFFERS];
+    private final long[] metal4Textures = new long[MTL4ArgumentTable.MAX_TEXTURES];
+    private final long[] metal4Samplers = new long[MTL4ArgumentTable.MAX_SAMPLERS];
+    private final long[] vertexBuffers = new long[64];
+    private final long[] vertexBufferOffsets = new long[64];
+    private final long[] fragmentBuffers = new long[64];
+    private final long[] fragmentBufferOffsets = new long[64];
+    private final long[] vertexTextures = new long[128];
+    private final long[] fragmentTextures = new long[128];
+    private final long[] vertexSamplers = new long[16];
+    private final long[] fragmentSamplers = new long[16];
 
     MTLRenderCommandEncoder(
             final MemorySegment handle,
@@ -70,6 +94,7 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
         super(handle, metal4);
         this.argumentTable = argumentTable;
         this.commandBuffer = commandBuffer;
+        invalidateBindingCache();
         if (metal4) {
             SET_MTL4_ARGUMENT_TABLE.send(
                     handle,
@@ -81,6 +106,7 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
 
     public void setRenderPipelineState(final MemorySegment pipeline) {
         SET_RENDER_PIPELINE_STATE.send(handle(), ObjC.orNil(pipeline));
+        invalidateBindingCache();
     }
 
     public void setDepthStencilState(final MemorySegment depthStencilState) {
@@ -107,7 +133,16 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
         if (this.metal4) {
             setMetal4Buffer(buffer, offset, index);
         } else {
+            int slot = checkedIndex(index, this.vertexBuffers.length, "vertex buffer");
+            long resource = handleAddress(buffer == null ? MemorySegment.NULL : buffer.handle());
+            if (this.vertexBuffers[slot] == resource && this.vertexBufferOffsets[slot] == offset) {
+                Stats.increment(Stats.Counter.BINDING_CACHE_HITS);
+                return;
+            }
             SET_VERTEX_BUFFER.send(handle(), seg(buffer), offset, index);
+            this.vertexBuffers[slot] = resource;
+            this.vertexBufferOffsets[slot] = offset;
+            Stats.increment(Stats.Counter.BINDING_CALLS);
         }
     }
 
@@ -115,7 +150,16 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
         if (this.metal4) {
             setMetal4Buffer(buffer, offset, index);
         } else {
+            int slot = checkedIndex(index, this.fragmentBuffers.length, "fragment buffer");
+            long resource = handleAddress(buffer == null ? MemorySegment.NULL : buffer.handle());
+            if (this.fragmentBuffers[slot] == resource && this.fragmentBufferOffsets[slot] == offset) {
+                Stats.increment(Stats.Counter.BINDING_CACHE_HITS);
+                return;
+            }
             SET_FRAGMENT_BUFFER.send(handle(), seg(buffer), offset, index);
+            this.fragmentBuffers[slot] = resource;
+            this.fragmentBufferOffsets[slot] = offset;
+            Stats.increment(Stats.Counter.BINDING_CALLS);
         }
     }
 
@@ -123,7 +167,14 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
         if (this.metal4) {
             setMetal4BufferOffset(offset, index);
         } else {
+            int slot = checkedIndex(index, this.vertexBuffers.length, "vertex buffer");
+            if (this.vertexBufferOffsets[slot] == offset) {
+                Stats.increment(Stats.Counter.BINDING_CACHE_HITS);
+                return;
+            }
             SET_VERTEX_BUFFER_OFFSET.send(handle(), offset, index);
+            this.vertexBufferOffsets[slot] = offset;
+            Stats.increment(Stats.Counter.BINDING_CALLS);
         }
     }
 
@@ -131,39 +182,78 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
         if (this.metal4) {
             setMetal4BufferOffset(offset, index);
         } else {
+            int slot = checkedIndex(index, this.fragmentBuffers.length, "fragment buffer");
+            if (this.fragmentBufferOffsets[slot] == offset) {
+                Stats.increment(Stats.Counter.BINDING_CACHE_HITS);
+                return;
+            }
             SET_FRAGMENT_BUFFER_OFFSET.send(handle(), offset, index);
+            this.fragmentBufferOffsets[slot] = offset;
+            Stats.increment(Stats.Counter.BINDING_CALLS);
         }
     }
 
     public void setVertexTexture(final MemorySegment texture, final long index) {
         if (this.metal4) {
-            requireArgumentTable().setTexture(texture, index);
+            setMetal4Texture(texture, index);
         } else {
+            int slot = checkedIndex(index, this.vertexTextures.length, "vertex texture");
+            long resource = handleAddress(texture);
+            if (this.vertexTextures[slot] == resource) {
+                Stats.increment(Stats.Counter.BINDING_CACHE_HITS);
+                return;
+            }
             SET_VERTEX_TEXTURE.send(handle(), ObjC.orNil(texture), index);
+            this.vertexTextures[slot] = resource;
+            Stats.increment(Stats.Counter.BINDING_CALLS);
         }
     }
 
     public void setFragmentTexture(final MemorySegment texture, final long index) {
         if (this.metal4) {
-            requireArgumentTable().setTexture(texture, index);
+            setMetal4Texture(texture, index);
         } else {
+            int slot = checkedIndex(index, this.fragmentTextures.length, "fragment texture");
+            long resource = handleAddress(texture);
+            if (this.fragmentTextures[slot] == resource) {
+                Stats.increment(Stats.Counter.BINDING_CACHE_HITS);
+                return;
+            }
             SET_FRAGMENT_TEXTURE.send(handle(), ObjC.orNil(texture), index);
+            this.fragmentTextures[slot] = resource;
+            Stats.increment(Stats.Counter.BINDING_CALLS);
         }
     }
 
     public void setVertexSamplerState(final MemorySegment sampler, final long index) {
         if (this.metal4) {
-            requireArgumentTable().setSampler(sampler, index);
+            setMetal4Sampler(sampler, index);
         } else {
+            int slot = checkedIndex(index, this.vertexSamplers.length, "vertex sampler");
+            long resource = handleAddress(sampler);
+            if (this.vertexSamplers[slot] == resource) {
+                Stats.increment(Stats.Counter.BINDING_CACHE_HITS);
+                return;
+            }
             SET_VERTEX_SAMPLER.send(handle(), ObjC.orNil(sampler), index);
+            this.vertexSamplers[slot] = resource;
+            Stats.increment(Stats.Counter.BINDING_CALLS);
         }
     }
 
     public void setFragmentSamplerState(final MemorySegment sampler, final long index) {
         if (this.metal4) {
-            requireArgumentTable().setSampler(sampler, index);
+            setMetal4Sampler(sampler, index);
         } else {
+            int slot = checkedIndex(index, this.fragmentSamplers.length, "fragment sampler");
+            long resource = handleAddress(sampler);
+            if (this.fragmentSamplers[slot] == resource) {
+                Stats.increment(Stats.Counter.BINDING_CACHE_HITS);
+                return;
+            }
             SET_FRAGMENT_SAMPLER.send(handle(), ObjC.orNil(sampler), index);
+            this.fragmentSamplers[slot] = resource;
+            Stats.increment(Stats.Counter.BINDING_CALLS);
         }
     }
 
@@ -191,7 +281,9 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
             if (this.commandBuffer == null) {
                 throw new IllegalStateException("Metal 4 render encoder has no command buffer");
             }
-            setMetal4Buffer(this.commandBuffer.makeInlineBuffer(bytes, length), 0L, index);
+            MTLCommandBuffer.InlineBufferSlice allocation =
+                    this.commandBuffer.makeInlineBuffer(bytes, length);
+            setMetal4Buffer(allocation.buffer(), allocation.offset(), index);
         } else {
             SET_VERTEX_BYTES.send(handle(), bytes, length, index);
         }
@@ -218,6 +310,7 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
 
     public void drawPrimitives(final MTLPrimitiveType primitiveType, final int firstVertex, final int vertexCount, final int instanceCount, final int baseInstance) {
         DRAW_PRIMITIVES.send(handle(), primitiveType.value, firstVertex, vertexCount, instanceCount, baseInstance);
+        Stats.increment(Stats.Counter.DRAWS);
     }
 
     public void drawIndexedPrimitives(final MTLPrimitiveType primitiveType, final int indexCount, final MTLIndexType indexType, final MTLBuffer indexBuffer, final long offset, final int instanceCount, final int baseVertex, final int baseInstance) {
@@ -237,6 +330,7 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
         } else {
             DRAW_INDEXED.send(handle(), primitiveType.value, indexCount, indexType.value, indexBuffer.handle(), offset, instanceCount, baseVertex, baseInstance);
         }
+        Stats.increment(Stats.Counter.DRAWS);
     }
 
     public void drawIndexedPrimitivesIndirect(final MTLPrimitiveType primitiveType, final MTLIndexType indexType, final MTLBuffer indexBuffer, final MTLBuffer indirectBuffer, final long indirectBufferOffset) {
@@ -252,6 +346,7 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
         } else {
             DRAW_INDEXED_INDIRECT.send(handle(), primitiveType.value, indexType.value, indexBuffer.handle(), 0L, indirectBuffer.handle(), indirectBufferOffset);
         }
+        Stats.increment(Stats.Counter.DRAWS);
     }
 
     public void drawPrimitivesIndirect(final MTLPrimitiveType primitiveType, final MTLBuffer indirectBuffer, final long indirectBufferOffset) {
@@ -260,6 +355,36 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
                     handle(), primitiveType.value, indirectBuffer.gpuAddress() + indirectBufferOffset);
         } else {
             DRAW_INDIRECT.send(handle(), primitiveType.value, indirectBuffer.handle(), indirectBufferOffset);
+        }
+        Stats.increment(Stats.Counter.DRAWS);
+    }
+
+    public void writeTimestamp(final MTLGpuCounterPool pool, final long index) {
+        if (this.metal4) {
+            MTL4_WRITE_TIMESTAMP.send(
+                    handle(), 0L, MTLRenderStages.Fragment.value, pool.handle(), index);
+        } else {
+            SAMPLE_COUNTERS.send(handle(), pool.handle(), index, false);
+        }
+    }
+
+    public void executeCommands(
+            final MTLIndirectCommandBuffer commands,
+            final int commandCount,
+            final MTLBuffer indexBuffer
+    ) {
+        if (commandCount <= 0) {
+            return;
+        }
+        if (!this.metal4) {
+            USE_RESOURCE.send(handle(), commands.handle(), 1L, MTLRenderStages.Vertex.value);
+            USE_RESOURCE.send(handle(), indexBuffer.handle(), 1L, MTLRenderStages.Vertex.value);
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            MemorySegment range = MemorySegment.ofAddress(stack.nmalloc(8, 16)).reinterpret(16);
+            range.set(JAVA_LONG, 0L, 0L);
+            range.set(JAVA_LONG, Long.BYTES, commandCount);
+            EXECUTE_ICB.send(handle(), commands.handle(), range);
         }
     }
 
@@ -288,7 +413,14 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
         }
         long base = buffer.gpuAddress();
         this.bufferBaseAddresses[(int) index] = base;
-        requireArgumentTable().setBufferAddress(base + offset, index);
+        long address = base + offset;
+        if (this.metal4BufferAddresses[(int) index] == address) {
+            Stats.increment(Stats.Counter.BINDING_CACHE_HITS);
+            return;
+        }
+        requireArgumentTable().setBufferAddress(address, index);
+        this.metal4BufferAddresses[(int) index] = address;
+        Stats.increment(Stats.Counter.BINDING_CALLS);
     }
 
     private void setMetal4BufferOffset(final long offset, final long index) {
@@ -299,7 +431,52 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
         if (base == 0L) {
             throw new IllegalStateException("Metal 4 buffer binding " + index + " has no base address");
         }
-        requireArgumentTable().setBufferAddress(base + offset, index);
+        long address = base + offset;
+        if (this.metal4BufferAddresses[(int) index] == address) {
+            Stats.increment(Stats.Counter.BINDING_CACHE_HITS);
+            return;
+        }
+        requireArgumentTable().setBufferAddress(address, index);
+        this.metal4BufferAddresses[(int) index] = address;
+        Stats.increment(Stats.Counter.BINDING_CALLS);
+    }
+
+    private void setMetal4Texture(final MemorySegment texture, final long index) {
+        int slot = checkedIndex(index, this.metal4Textures.length, "Metal 4 texture");
+        long resource = handleAddress(texture);
+        if (this.metal4Textures[slot] == resource) {
+            Stats.increment(Stats.Counter.BINDING_CACHE_HITS);
+            return;
+        }
+        requireArgumentTable().setTexture(texture, index);
+        this.metal4Textures[slot] = resource;
+        Stats.increment(Stats.Counter.BINDING_CALLS);
+    }
+
+    private void setMetal4Sampler(final MemorySegment sampler, final long index) {
+        int slot = checkedIndex(index, this.metal4Samplers.length, "Metal 4 sampler");
+        long resource = handleAddress(sampler);
+        if (this.metal4Samplers[slot] == resource) {
+            Stats.increment(Stats.Counter.BINDING_CACHE_HITS);
+            return;
+        }
+        requireArgumentTable().setSampler(sampler, index);
+        this.metal4Samplers[slot] = resource;
+        Stats.increment(Stats.Counter.BINDING_CALLS);
+    }
+
+    public void invalidateBindingCache() {
+        Arrays.fill(this.metal4BufferAddresses, Long.MIN_VALUE);
+        Arrays.fill(this.metal4Textures, Long.MIN_VALUE);
+        Arrays.fill(this.metal4Samplers, Long.MIN_VALUE);
+        Arrays.fill(this.vertexBuffers, Long.MIN_VALUE);
+        Arrays.fill(this.vertexBufferOffsets, Long.MIN_VALUE);
+        Arrays.fill(this.fragmentBuffers, Long.MIN_VALUE);
+        Arrays.fill(this.fragmentBufferOffsets, Long.MIN_VALUE);
+        Arrays.fill(this.vertexTextures, Long.MIN_VALUE);
+        Arrays.fill(this.fragmentTextures, Long.MIN_VALUE);
+        Arrays.fill(this.vertexSamplers, Long.MIN_VALUE);
+        Arrays.fill(this.fragmentSamplers, Long.MIN_VALUE);
     }
 
     private MTL4ArgumentTable requireArgumentTable() {
@@ -319,5 +496,16 @@ public final class MTLRenderCommandEncoder extends MTLCommandEncoder {
 
     private static MemorySegment seg(final MTLBuffer buffer) {
         return buffer == null ? MemorySegment.NULL : buffer.handle();
+    }
+
+    private static int checkedIndex(final long index, final int length, final String kind) {
+        if (index < 0L || index >= length) {
+            throw new IllegalArgumentException(kind + " binding index out of range: " + index);
+        }
+        return (int) index;
+    }
+
+    private static long handleAddress(final MemorySegment handle) {
+        return ObjC.isNil(handle) ? 0L : handle.address();
     }
 }

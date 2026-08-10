@@ -8,6 +8,7 @@ import org.lwjgl.system.MemoryStack;
 import java.lang.foreign.MemorySegment;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
+import static java.lang.foreign.ValueLayout.JAVA_BOOLEAN;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
 @Environment(EnvType.CLIENT)
@@ -27,6 +28,10 @@ public final class MTLBlitCommandEncoder extends MTLCommandEncoder {
     private static final Msg MTL4_WAIT_FOR_FENCE =
             Msg.ofVoid("waitForFence:beforeEncoderStages:", ADDRESS, JAVA_LONG);
     private static final long MTL_STAGE_BLIT = 1L << 28;
+    private static final Msg SAMPLE_COUNTERS = Msg.ofVoid(
+            "sampleCountersInBuffer:atSampleIndex:withBarrier:", ADDRESS, JAVA_LONG, JAVA_BOOLEAN);
+    private static final Msg MTL4_WRITE_TIMESTAMP = Msg.ofVoid(
+            "writeTimestampWithGranularity:intoHeap:atIndex:", JAVA_LONG, ADDRESS, JAVA_LONG);
 
     MTLBlitCommandEncoder(final MemorySegment handle, final boolean metal4) {
         super(handle, metal4);
@@ -143,6 +148,14 @@ public final class MTLBlitCommandEncoder extends MTLCommandEncoder {
             MTL4_WAIT_FOR_FENCE.send(handle(), fence.handle(), MTL_STAGE_BLIT);
         } else {
             WAIT_FOR_FENCE.send(handle(), fence.handle());
+        }
+    }
+
+    public void writeTimestamp(final MTLGpuCounterPool pool, final long index) {
+        if (this.metal4) {
+            MTL4_WRITE_TIMESTAMP.send(handle(), 0L, pool.handle(), index);
+        } else {
+            SAMPLE_COUNTERS.send(handle(), pool.handle(), index, false);
         }
     }
 }

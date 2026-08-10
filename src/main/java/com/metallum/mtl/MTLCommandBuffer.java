@@ -17,6 +17,8 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
 @Environment(EnvType.CLIENT)
 public final class MTLCommandBuffer {
+    private static final long INLINE_ARENA_SIZE = 64L * 1024L;
+    private static final long INLINE_ALIGNMENT = 256L;
     private static final long STATUS_COMPLETED = 4;
     private static final long STATUS_ERROR = 5;
 
@@ -47,6 +49,10 @@ public final class MTLCommandBuffer {
     private final MTLResidencySet residencySet;
     private final List<MemorySegment> retainedObjects = new ArrayList<>(1);
     private final List<MemorySegment> inlineAllocations = new ArrayList<>();
+    @Nullable
+    private MTLBuffer inlineBuffer;
+    private long inlineCapacity;
+    private long inlineOffset;
     private boolean ended;
     private boolean committed;
     private volatile boolean metal4Completed;
@@ -294,28 +300,33 @@ public final class MTLCommandBuffer {
         return isCompleted();
     }
 
-    MTLBuffer makeInlineBuffer(final MemorySegment bytes, final long length) {
+    InlineBufferSlice makeInlineBuffer(final MemorySegment bytes, final long length) {
         if (!this.metal4 || this.device == null || length <= 0L) {
             throw new IllegalStateException("Inline Metal 4 buffer allocation is unavailable");
         }
-        MTLBuffer buffer = this.device.newBuffer(
-                length,
-                MTLResourceOptions.of(MTLStorageMode.Shared, MTLHazardTrackingMode.Untracked)
-        );
-        if (this.residencySet != null) {
-            this.residencySet.addAllocation(buffer.handle());
-        }
-        MemorySegment destination = buffer.contents();
-        if (ObjC.isNil(destination)) {
+        long alignedOffset = alignUp(this.inlineOffset, INLINE_ALIGNMENT);
+        if (this.inlineBuffer == null || length > this.inlineCapacity - alignedOffset) {
+            long capacity = Math.max(INLINE_ARENA_SIZE, alignUp(length, INLINE_ALIGNMENT));
+            this.inlineBuffer = this.device.newBuffer(
+                    capacity,
+                    MTLResourceOptions.of(MTLStorageMode.Shared, MTLHazardTrackingMode.Untracked)
+            );
+            this.inlineCapacity = capacity;
+            alignedOffset = 0L;
             if (this.residencySet != null) {
-                this.residencySet.removeAllocation(buffer.handle());
+                this.residencySet.addAllocation(this.inlineBuffer.handle());
             }
-            ObjC.release(buffer.handle());
+            this.inlineAllocations.add(this.inlineBuffer.handle());
+        }
+        MemorySegment destination = this.inlineBuffer.contents();
+        if (ObjC.isNil(destination)) {
             throw new IllegalStateException("Metal 4 inline MTLBuffer.contents returned nil");
         }
-        destination.reinterpret(length).copyFrom(bytes.asSlice(0L, length));
-        this.inlineAllocations.add(buffer.handle());
-        return buffer;
+        destination.reinterpret(this.inlineCapacity)
+                .asSlice(alignedOffset, length)
+                .copyFrom(bytes.asSlice(0L, length));
+        this.inlineOffset = Math.addExact(alignedOffset, length);
+        return new InlineBufferSlice(this.inlineBuffer, alignedOffset);
     }
 
     public boolean isMetal4() {
@@ -362,11 +373,15 @@ public final class MTLCommandBuffer {
         this.retainedObjects.clear();
         for (MemorySegment allocation : this.inlineAllocations) {
             if (this.residencySet != null) {
-                this.residencySet.removeAllocation(allocation);
+                this.residencySet.removeAllocationAndRelease(allocation);
+            } else {
+                ObjC.release(allocation);
             }
-            ObjC.release(allocation);
         }
         this.inlineAllocations.clear();
+        this.inlineBuffer = null;
+        this.inlineCapacity = 0L;
+        this.inlineOffset = 0L;
     }
 
     public MemorySegment handle() {
@@ -374,5 +389,12 @@ public final class MTLCommandBuffer {
             throw new IllegalStateException("MTLCommandBuffer is closed");
         }
         return handle;
+    }
+
+    private static long alignUp(final long value, final long alignment) {
+        return Math.addExact(value, alignment - 1L) & -alignment;
+    }
+
+    record InlineBufferSlice(MTLBuffer buffer, long offset) {
     }
 }
