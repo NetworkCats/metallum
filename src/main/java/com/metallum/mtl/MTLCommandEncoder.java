@@ -12,9 +12,15 @@ public abstract class MTLCommandEncoder {
     private static final Msg END_ENCODING = Msg.ofVoid("endEncoding");
 
     MemorySegment handle;
+    final boolean metal4;
 
     MTLCommandEncoder(final MemorySegment handle) {
+        this(handle, false);
+    }
+
+    MTLCommandEncoder(final MemorySegment handle, final boolean metal4) {
         this.handle = handle;
+        this.metal4 = metal4;
     }
 
     public MemorySegment handle() {

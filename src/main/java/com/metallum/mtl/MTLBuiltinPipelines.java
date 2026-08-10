@@ -92,17 +92,29 @@ public final class MTLBuiltinPipelines {
             """;
 
     private static MTLDevice device;
+    @Nullable
+    private static MTLResidencySet residencySet;
+    @Nullable
+    private static MTL4Compiler metal4Compiler;
     private static MemorySegment presentPipeline = MemorySegment.NULL;
     private static MemorySegment presentLinearSampler = MemorySegment.NULL;
     private static MemorySegment presentNearestSampler = MemorySegment.NULL;
     private static final Map<Long, MemorySegment> clearPipelines = new HashMap<>();
     private static final Map<Long, MemorySegment> depthStencilStates = new HashMap<>();
+    private static final Map<String, MemorySegment> libraries = new HashMap<>();
+    private static final Map<BuiltinFunctionKey, MemorySegment> functions = new HashMap<>();
 
     private MTLBuiltinPipelines() {
     }
 
-    public static void init(final MTLDevice mtlDevice) {
+    public static void init(
+            final MTLDevice mtlDevice,
+            @Nullable final MTLResidencySet liveResidencySet,
+            @Nullable final MTL4Compiler compiler
+    ) {
         device = mtlDevice;
+        residencySet = liveResidencySet;
+        metal4Compiler = compiler;
         presentPipeline = buildPipeline(PRESENT_MSL, "metallum_present_vs", "metallum_present_fs",
                 MTLPixelFormat.BGRA8Unorm.value, MTLPixelFormat.Invalid.value, MTLColorWriteMask.All.value);
         presentLinearSampler = buildPresentSampler(MTLSamplerMinMagFilter.Linear);
@@ -114,7 +126,7 @@ public final class MTLBuiltinPipelines {
 
     public static void close() {
         if (!ObjC.isNil(presentPipeline)) {
-            ObjC.release(presentPipeline);
+            releasePipeline(presentPipeline);
             presentPipeline = MemorySegment.NULL;
         }
         if (!ObjC.isNil(presentLinearSampler)) {
@@ -125,10 +137,19 @@ public final class MTLBuiltinPipelines {
             ObjC.release(presentNearestSampler);
             presentNearestSampler = MemorySegment.NULL;
         }
-        clearPipelines.values().forEach(ObjC::release);
+        clearPipelines.values().forEach(MTLBuiltinPipelines::releasePipeline);
         clearPipelines.clear();
         depthStencilStates.values().forEach(ObjC::release);
         depthStencilStates.clear();
+        functions.values().forEach(MTLBuiltinPipelines::releaseIfPresent);
+        functions.clear();
+        libraries.values().forEach(MTLBuiltinPipelines::releaseIfPresent);
+        libraries.clear();
+        if (residencySet != null) {
+            residencySet.commitIfNeeded();
+        }
+        residencySet = null;
+        metal4Compiler = null;
         device = null;
     }
 
@@ -203,7 +224,7 @@ public final class MTLBuiltinPipelines {
             boolean fullRegion = clampedX == 0 && clampedY == 0 && clampedMaxX == textureWidth && clampedMaxY == textureHeight;
 
             MTLRenderCommandEncoder encoder;
-            try (MTLRenderPassDescriptor renderPass = new MTLRenderPassDescriptor()) {
+            try (MTLRenderPassDescriptor renderPass = new MTLRenderPassDescriptor(commandBuffer.isMetal4())) {
                 renderPass.colorAttachment(
                         0,
                         colorTexture,
@@ -269,7 +290,7 @@ public final class MTLBuiltinPipelines {
             MemorySegment drawableTexture = drawable.texture();
 
             MTLRenderCommandEncoder encoder;
-            try (MTLRenderPassDescriptor renderPass = new MTLRenderPassDescriptor()) {
+            try (MTLRenderPassDescriptor renderPass = new MTLRenderPassDescriptor(commandBuffer.isMetal4())) {
                 renderPass.colorAttachment(
                         0,
                         drawableTexture,
@@ -378,11 +399,28 @@ public final class MTLBuiltinPipelines {
             final long depthFormat,
             final long writeMask
     ) {
-        MemorySegment vertexFunction = device.newFunction(mslSource, vertexEntry);
-        MemorySegment fragmentFunction = device.newFunction(mslSource, fragmentEntry);
+        if (metal4Compiler != null) {
+            MemorySegment library = libraries.computeIfAbsent(mslSource, metal4Compiler::newLibrary);
+            if (ObjC.isNil(library)) {
+                return MemorySegment.NULL;
+            }
+            MemorySegment pipeline;
+            try (MTL4RenderPipelineDescriptor descriptor = new MTL4RenderPipelineDescriptor()) {
+                descriptor.setFunctions(library, vertexEntry, library, fragmentEntry);
+                descriptor.setColorAttachmentFormat(0, colorFormat);
+                descriptor.setInputPrimitiveTopology(3L);
+                descriptor.disableBlending(0, writeMask);
+                pipeline = metal4Compiler.newRenderPipelineState(descriptor);
+            }
+            if (!ObjC.isNil(pipeline) && residencySet != null) {
+                residencySet.addAllocation(pipeline);
+            }
+            return pipeline;
+        }
+
+        MemorySegment vertexFunction = function(mslSource, vertexEntry);
+        MemorySegment fragmentFunction = function(mslSource, fragmentEntry);
         if (ObjC.isNil(vertexFunction) || ObjC.isNil(fragmentFunction)) {
-            releaseIfPresent(vertexFunction);
-            releaseIfPresent(fragmentFunction);
             return MemorySegment.NULL;
         }
         MemorySegment pipeline;
@@ -393,9 +431,19 @@ public final class MTLBuiltinPipelines {
             descriptor.disableBlending(0, writeMask);
             pipeline = device.newRenderPipelineState(descriptor);
         }
-        ObjC.release(vertexFunction);
-        ObjC.release(fragmentFunction);
+        if (!ObjC.isNil(pipeline) && residencySet != null) {
+            residencySet.addAllocation(pipeline);
+        }
         return pipeline;
+    }
+
+    private static MemorySegment function(final String mslSource, final String entryPoint) {
+        return functions.computeIfAbsent(new BuiltinFunctionKey(mslSource, entryPoint), key -> {
+            MemorySegment library = libraries.computeIfAbsent(key.mslSource(), device::newLibrary);
+            return ObjC.isNil(library)
+                    ? MemorySegment.NULL
+                    : device.newFunction(library, key.entryPoint());
+        });
     }
 
     private static MemorySegment buildPresentSampler(final MTLSamplerMinMagFilter filter) {
@@ -413,6 +461,19 @@ public final class MTLBuiltinPipelines {
         if (!ObjC.isNil(object)) {
             ObjC.release(object);
         }
+    }
+
+    private static void releasePipeline(final MemorySegment pipeline) {
+        if (ObjC.isNil(pipeline)) {
+            return;
+        }
+        if (residencySet != null) {
+            residencySet.removeAllocation(pipeline);
+        }
+        ObjC.release(pipeline);
+    }
+
+    private record BuiltinFunctionKey(String mslSource, String entryPoint) {
     }
 
 }

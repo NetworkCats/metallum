@@ -68,6 +68,9 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
     }
 
     MTLBlitCommandEncoder blitCommandEncoder() {
+        if (currentEncoder instanceof MTLBlitCommandEncoder encoder) {
+            return encoder;
+        }
         endEncoder();
         MTLBlitCommandEncoder encoder = commandBuffer().makeBlitCommandEncoder();
         encoder.waitForFence(fence);
@@ -106,6 +109,7 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
 
             int slot = (int) (currentSubmitIndex % MAX_SUBMITS_IN_FLIGHT);
             submitSemaphores[slot].drainPermits();
+            device.commitResidencyChanges();
             commandBuffer.commitWithCompletionBlock(submitSignalBlocks[slot]);
 
             toClose = inFlight[slot];
@@ -118,12 +122,19 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             throw new IllegalStateException("5s timeout reached when waiting for Metal submit completion");
         }
 
+        String commandError = null;
         if (toClose != null) {
+            commandError = toClose.buffer.errorDescription();
             toClose.buffer.close();
         }
 
         transientMemory.rotate();
         destroyQueue.rotate();
+
+        if (commandError != null) {
+            device.recordCommandError(commandError);
+            throw new IllegalStateException("Metal command buffer failed: " + commandError);
+        }
     }
 
     MTLRenderCommandEncoder renderCommandEncoder(
@@ -320,7 +331,6 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
                 destination.offset(),
                 length
         );
-        endEncoder();
     }
 
     private void orphanWrite(final MetalGpuBuffer buffer, final long offset, final ByteBuffer data) {
@@ -348,7 +358,9 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         if (bucket != null && !bucket.isEmpty()) {
             return bucket.pop();
         }
-        return device.metalDevice().newBuffer(size, resourceOptions);
+        MTLBuffer buffer = device.metalDevice().newBuffer(size, resourceOptions);
+        device.trackAllocation(buffer.handle());
+        return buffer;
     }
 
     private void recycleDynamicBacking(final MTLBuffer buffer, final long size) {
@@ -367,7 +379,6 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
                 target.offset(),
                 source.length()
         );
-        endEncoder();
     }
 
     @Override
@@ -403,7 +414,6 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
                 destX,
                 destY
         );
-        endEncoder();
     }
 
     @Override
@@ -442,7 +452,6 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
                 destinationX,
                 destinationY
         );
-        endEncoder();
     }
 
     @Override
@@ -483,8 +492,6 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
                 rowBytes,
                 bytesPerImage
         );
-
-        endEncoder();
         queueForDestroy(callback);
     }
 
@@ -519,7 +526,6 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
                 destX,
                 destY
         );
-        endEncoder();
     }
 
     @Override
@@ -541,6 +547,9 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         int slot = (int) (submitIndex % MAX_SUBMITS_IN_FLIGHT);
         InFlight f = inFlight[slot];
         if (f != null && f.index == submitIndex) {
+            if (f.buffer.isMetal4()) {
+                return f.buffer.waitUntilCompleted(timeoutMs);
+            }
             Semaphore semaphore = submitSemaphores[slot];
             try {
                 if (!semaphore.tryAcquire(Math.max(timeoutMs, 0L), TimeUnit.MILLISECONDS)) {
@@ -574,7 +583,7 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         destroyQueue.close();
         for (ArrayDeque<MTLBuffer> bucket : dynamicBackingPool.values()) {
             for (MTLBuffer buffer : bucket) {
-                ObjC.release(buffer.handle());
+                device.releaseAllocationNow(buffer.handle());
             }
         }
         dynamicBackingPool.clear();

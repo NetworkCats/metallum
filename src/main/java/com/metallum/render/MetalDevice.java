@@ -1,5 +1,6 @@
 package com.metallum.render;
 
+import com.metallum.Metallum;
 import com.metallum.mtl.*;
 import com.metallum.objc.Cocoa;
 import com.metallum.objc.ObjC;
@@ -40,11 +41,20 @@ final class MetalDevice implements GpuDeviceBackend {
     private final GpuDebugOptions debugOptions;
     private final MetalCommandEncoder commandEncoder;
     private final DeviceInfo deviceInfo;
+    @Nullable
+    private final MTLResidencySet residencySet;
+    private final boolean metal4Available;
+    private final boolean metal4CommandPath;
+    @Nullable
+    private final MTL4Compiler metal4Compiler;
+    private final boolean concurrentCompilationEnabled;
     public final MTLCommandQueue commandQueue;
     private final Map<RenderPipeline, MetalCompiledRenderPipeline> compiledPipelines = new IdentityHashMap<>();
     private final Map<ShaderCompilationKey, IntermediaryShaderModule> shaderCache = new HashMap<>();
+    private final Map<String, MemorySegment> libraryCache = new HashMap<>();
     private final Map<MslFunctionKey, MemorySegment> functionCache = new HashMap<>();
     private final Map<Long, MemorySegment> depthStencilStates = new HashMap<>();
+    private final ArrayDeque<String> debugMessages = new ArrayDeque<>();
     private final ShaderSource defaultShaderSource;
 
     MetalDevice(
@@ -61,9 +71,40 @@ final class MetalDevice implements GpuDeviceBackend {
         this.metalDevice = new MTLDevice(metalDeviceHandle);
         this.metalLayer = metalLayer;
         this.cocoa = cocoa;
+        this.metal4Available = this.metalDevice.supportsMetal4();
+        this.concurrentCompilationEnabled = this.metalDevice.enableConcurrentCompilation();
+        this.residencySet = MTLResidencySet.create(
+                this.metalDevice,
+                4096L,
+                this.useLabels() ? "Metallum live resources" : null
+        );
         MTLCommandQueue.setDebugLabelsEnabled(this.useLabels());
-        this.commandQueue = this.metalDevice.newCommandQueue();
-        MTLBuiltinPipelines.init(this.metalDevice);
+        MTLCommandQueue selectedQueue = this.metalDevice.newCommandQueue(
+                this.metal4Available && this.residencySet != null
+        );
+        MTL4Compiler selectedCompiler = selectedQueue.isMetal4()
+                ? MTL4Compiler.create(
+                this.metalDevice,
+                this.useLabels() ? "Metallum shader compiler" : null
+        )
+                : null;
+        if (selectedQueue.isMetal4() && selectedCompiler == null) {
+            Metallum.LOGGER.warn("[metallum] Metal 4 compiler is unavailable; falling back to the complete Metal 3 path");
+            selectedQueue.close();
+            selectedQueue = this.metalDevice.newCommandQueue(false);
+        }
+        this.commandQueue = selectedQueue;
+        this.metal4CommandPath = selectedQueue.isMetal4();
+        this.metal4Compiler = selectedCompiler;
+        if (this.residencySet != null) {
+            this.commandQueue.addResidencySet(this.residencySet);
+            this.commandQueue.useUnretainedCommandBuffers(true);
+        }
+        MTLBuiltinPipelines.init(
+                this.metalDevice,
+                this.metal4CommandPath ? this.residencySet : null,
+                this.metal4Compiler
+        );
         this.commandEncoder = new MetalCommandEncoder(this);
         this.deviceInfo = buildDeviceInfo(deviceName);
     }
@@ -140,7 +181,7 @@ final class MetalDevice implements GpuDeviceBackend {
 
     @Override
     public @NonNull List<String> getLastDebugMessages() {
-        return List.of();
+        return List.copyOf(this.debugMessages);
     }
 
     @Override
@@ -171,6 +212,12 @@ final class MetalDevice implements GpuDeviceBackend {
             }
         }
         this.functionCache.clear();
+        for (MemorySegment library : this.libraryCache.values()) {
+            if (!ObjC.isNil(library)) {
+                ObjC.release(library);
+            }
+        }
+        this.libraryCache.clear();
     }
 
     @Override
@@ -183,11 +230,19 @@ final class MetalDevice implements GpuDeviceBackend {
         } catch (Throwable ignored) {
         }
         MTLBuiltinPipelines.close();
-        this.commandQueue.close();
+        if (this.metal4Compiler != null) {
+            this.metal4Compiler.close();
+        }
         for (MemorySegment state : depthStencilStates.values()) {
             ObjC.release(state);
         }
         depthStencilStates.clear();
+        if (this.residencySet != null) {
+            this.residencySet.commitIfNeeded();
+            this.commandQueue.removeResidencySet(this.residencySet);
+            this.residencySet.close();
+        }
+        this.commandQueue.close();
         ObjC.release(this.metalDeviceHandle);
     }
 
@@ -237,6 +292,61 @@ final class MetalDevice implements GpuDeviceBackend {
         this.commandEncoder.queueForDestroy(() -> ObjC.release(handle));
     }
 
+    void trackAllocation(final MemorySegment handle) {
+        if (this.residencySet != null) {
+            this.residencySet.addAllocation(handle);
+        }
+    }
+
+    void queueAllocationRelease(final MemorySegment handle) {
+        this.commandEncoder.queueForDestroy(() -> this.releaseAllocationNow(handle));
+    }
+
+    void releaseAllocationNow(final MemorySegment handle) {
+        if (this.residencySet != null) {
+            this.residencySet.removeAllocation(handle);
+        }
+        ObjC.release(handle);
+    }
+
+    void commitResidencyChanges() {
+        if (this.residencySet != null) {
+            this.residencySet.commitIfNeeded();
+        }
+    }
+
+    void recordCommandError(final String message) {
+        if (this.debugMessages.size() == 64) {
+            this.debugMessages.removeFirst();
+        }
+        this.debugMessages.addLast(message);
+    }
+
+    boolean usesExplicitResidency() {
+        return this.residencySet != null;
+    }
+
+    boolean metal4Available() {
+        return this.metal4Available;
+    }
+
+    boolean usesMetal4CommandPath() {
+        return this.metal4CommandPath;
+    }
+
+    boolean concurrentCompilationEnabled() {
+        return this.concurrentCompilationEnabled;
+    }
+
+    @Nullable
+    MTL4Compiler metal4Compiler() {
+        return this.metal4Compiler;
+    }
+
+    boolean usesMetal4Compiler() {
+        return this.metal4Compiler != null;
+    }
+
     MetalCompiledRenderPipeline getOrCompilePipeline(final RenderPipeline pipeline) {
         return this.compiledPipelines.computeIfAbsent(pipeline, p -> MetalCrossShaderCompiler.compile(this, p, this.defaultShaderSource));
     }
@@ -266,7 +376,21 @@ final class MetalDevice implements GpuDeviceBackend {
     MemorySegment getOrCompileFunction(final String msl, final String entryPoint) {
         return this.functionCache.computeIfAbsent(
                 new MslFunctionKey(msl, entryPoint),
-                key -> this.metalDevice.newFunction(key.msl(), key.entryPoint())
+                key -> {
+                    MemorySegment library = getOrCompileLibrary(key.msl());
+                    return ObjC.isNil(library)
+                            ? MemorySegment.NULL
+                            : this.metalDevice.newFunction(library, key.entryPoint());
+                }
+        );
+    }
+
+    MemorySegment getOrCompileLibrary(final String msl) {
+        return this.libraryCache.computeIfAbsent(
+                msl,
+                source -> this.metal4Compiler == null
+                        ? this.metalDevice.newLibrary(source)
+                        : this.metal4Compiler.newLibrary(source)
         );
     }
 
@@ -280,7 +404,11 @@ final class MetalDevice implements GpuDeviceBackend {
         DeviceType type = DeviceType.INTEGRATED;
         Set<String> extensions = Set.of();
         String osVersion = System.getProperty("os.version", "").trim();
-        String driverDescription = "macOS " + osVersion;
+        String driverDescription = "macOS " + osVersion
+                + (this.metal4CommandPath
+                ? "; Metal 4"
+                : this.metal4Available ? "; Metal 4 available; Metal 3 command path" : "; Metal 3")
+                + (this.residencySet != null ? "; explicit residency" : "");
         long maxMemoryAllocationSize = Math.min(metalDevice.maxBufferLength(), metalDevice.recommendedMaxWorkingSetSize());
         return new DeviceInfo(
                 deviceName,
@@ -288,7 +416,7 @@ final class MetalDevice implements GpuDeviceBackend {
                 driverDescription,
                 true,
                 "Metal",
-                1.0F,
+                this.metal4CommandPath ? 4.0F : 3.0F,
                 new DeviceLimits(16, 256, 16384, maxMemoryAllocationSize, 0, 1),
                 new DeviceFeatures(false, false, true, true, true, false, true),
                 extensions,

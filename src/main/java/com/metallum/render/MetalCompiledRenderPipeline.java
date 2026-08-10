@@ -37,6 +37,7 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
     }
 
     private final List<ResourceBinding> resources;
+    private final MetalDevice device;
     private final Map<String, ResourceBinding> resourcesByName;
     private final long allResourceMask;
     private final int firstAvailableVertexBufferSlot;
@@ -60,6 +61,7 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
             final String fragmentEntryPoint,
             final List<ResourceBinding> resources
     ) {
+        this.device = device;
         this.resources = resources;
         this.resourcesByName = resources.stream().collect(java.util.stream.Collectors.toUnmodifiableMap(ResourceBinding::name, binding -> binding));
 
@@ -100,14 +102,89 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
         var colorTarget = info.getColorTargetState();
         MTLPixelFormat colorFormat = colorTarget != null ? MTLPixelFormat.from(colorTarget.format()) : MTLPixelFormat.RGBA8Unorm;
 
-        MemorySegment vertexFunction = device.getOrCompileFunction(vertexMsl, vertexEntryPoint);
-        MemorySegment fragmentFunction = device.getOrCompileFunction(fragmentMsl, fragmentEntryPoint);
-
         try (MTLVertexDescriptor vertexDescriptor = buildVertexDescriptor(info, this.firstAvailableVertexBufferSlot)) {
-            this.withDepthPipeline = createPipeline(device, info, vertexFunction, fragmentFunction, vertexDescriptor, colorFormat, MTLPixelFormat.Depth32Float);
-            this.withoutDepthPipeline = depthStencilState == null
-                    ? createPipeline(device, info, vertexFunction, fragmentFunction, vertexDescriptor, colorFormat, MTLPixelFormat.Invalid)
-                    : MemorySegment.NULL;
+            MTL4Compiler compiler = device.metal4Compiler();
+            if (compiler != null) {
+                MemorySegment vertexLibrary = device.getOrCompileLibrary(vertexMsl);
+                MemorySegment fragmentLibrary = device.getOrCompileLibrary(fragmentMsl);
+                this.withDepthPipeline = createMetal4Pipeline(
+                        device,
+                        compiler,
+                        info,
+                        vertexLibrary,
+                        vertexEntryPoint,
+                        fragmentLibrary,
+                        fragmentEntryPoint,
+                        vertexDescriptor,
+                        colorFormat,
+                        this.topology
+                );
+                this.withoutDepthPipeline = this.withDepthPipeline;
+            } else {
+                MemorySegment vertexFunction = device.getOrCompileFunction(vertexMsl, vertexEntryPoint);
+                MemorySegment fragmentFunction = device.getOrCompileFunction(fragmentMsl, fragmentEntryPoint);
+                this.withDepthPipeline = createPipeline(device, info, vertexFunction, fragmentFunction, vertexDescriptor, colorFormat, MTLPixelFormat.Depth32Float);
+                this.withoutDepthPipeline = depthStencilState == null
+                        ? createPipeline(device, info, vertexFunction, fragmentFunction, vertexDescriptor, colorFormat, MTLPixelFormat.Invalid)
+                        : MemorySegment.NULL;
+            }
+        }
+    }
+
+    private static MemorySegment createMetal4Pipeline(
+            final MetalDevice device,
+            final MTL4Compiler compiler,
+            final RenderPipeline info,
+            final MemorySegment vertexLibrary,
+            final String vertexEntryPoint,
+            final MemorySegment fragmentLibrary,
+            final String fragmentEntryPoint,
+            final MTLVertexDescriptor vertexDescriptor,
+            final MTLPixelFormat colorFormat,
+            final MTLPrimitiveType topology
+    ) {
+        if (ObjC.isNil(vertexLibrary) || ObjC.isNil(fragmentLibrary)) {
+            return MemorySegment.NULL;
+        }
+
+        ColorTargetState colorTarget = info.getColorTargetState();
+        Optional<BlendFunction> blendFunction = colorTarget == null ? Optional.empty() : colorTarget.blendFunction();
+        long writeMask = colorTarget == null ? MTLColorWriteMask.All.value : MTLColorWriteMask.from(colorTarget.writeMask());
+
+        try (MTL4RenderPipelineDescriptor descriptor = new MTL4RenderPipelineDescriptor()) {
+            descriptor.setFunctions(
+                    vertexLibrary,
+                    vertexEntryPoint,
+                    fragmentLibrary,
+                    fragmentEntryPoint
+            );
+            descriptor.setVertexDescriptor(vertexDescriptor);
+            descriptor.setColorAttachmentFormat(0, colorFormat.value);
+            descriptor.setInputPrimitiveTopology(topologyClass(topology));
+
+            if (blendFunction.isPresent()) {
+                BlendFunction function = blendFunction.get();
+                descriptor.setBlendState(
+                        0,
+                        MTLBlendFactor.from(function.color().sourceFactor()),
+                        MTLBlendFactor.from(function.color().destFactor()),
+                        MTLBlendOperation.from(function.color().op()),
+                        MTLBlendFactor.from(function.alpha().sourceFactor()),
+                        MTLBlendFactor.from(function.alpha().destFactor()),
+                        MTLBlendOperation.from(function.alpha().op()),
+                        writeMask
+                );
+            } else {
+                descriptor.disableBlending(0, writeMask);
+            }
+
+            MemorySegment pipeline = compiler.newRenderPipelineState(descriptor);
+            if (ObjC.isNil(pipeline)) {
+                Metallum.LOGGER.error("[metallum] Metal 4 pipeline {} failed to build", info.getLocation());
+            } else {
+                device.trackAllocation(pipeline);
+            }
+            return pipeline;
         }
     }
 
@@ -153,6 +230,8 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
             MemorySegment pipeline = device.metalDevice().newRenderPipelineState(pipelineDesc);
             if (ObjC.isNil(pipeline)) {
                 Metallum.LOGGER.error("[metallum] Pipeline {} failed to build with depth format {}", info.getLocation(), depthFormat);
+            } else if (device.usesMetal4CommandPath()) {
+                device.trackAllocation(pipeline);
             }
             return pipeline;
         }
@@ -256,13 +335,30 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
         return maxVertexBufferBinding + 1;
     }
 
+    private static long topologyClass(final MTLPrimitiveType topology) {
+        return switch (topology) {
+            case Point -> 1L;
+            case Line, LineStrip -> 2L;
+            case Triangle, TriangleStrip, TriangleFan -> 3L;
+        };
+    }
+
     @Override
     public void close() {
         if (!ObjC.isNil(this.withDepthPipeline)) {
-            ObjC.release(this.withDepthPipeline);
+            releasePipeline(this.withDepthPipeline);
         }
-        if (!ObjC.isNil(this.withoutDepthPipeline)) {
-            ObjC.release(this.withoutDepthPipeline);
+        if (!ObjC.isNil(this.withoutDepthPipeline)
+                && this.withoutDepthPipeline.address() != this.withDepthPipeline.address()) {
+            releasePipeline(this.withoutDepthPipeline);
+        }
+    }
+
+    private void releasePipeline(final MemorySegment pipeline) {
+        if (this.device.usesMetal4CommandPath()) {
+            this.device.releaseAllocationNow(pipeline);
+        } else {
+            ObjC.release(pipeline);
         }
     }
 }

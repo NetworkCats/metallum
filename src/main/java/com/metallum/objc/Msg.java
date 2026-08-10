@@ -94,6 +94,14 @@ public record Msg(String name, MemorySegment sel, MethodHandle handle) {
         }
     }
 
+    public void send(MemorySegment self, MemorySegment a, long b, MemorySegment c) {
+        try {
+            handle.invokeExact(self, sel, a, b, c);
+        } catch (Throwable throwable) {
+            throw fail(throwable);
+        }
+    }
+
     public void send(MemorySegment self, long a, MemorySegment b, long c) {
         try {
             handle.invokeExact(self, sel, a, b, c);
@@ -105,6 +113,14 @@ public record Msg(String name, MemorySegment sel, MethodHandle handle) {
     public void send(MemorySegment self, long a, long b, long c, long d, long e) {
         try {
             handle.invokeExact(self, sel, a, b, c, d, e);
+        } catch (Throwable throwable) {
+            throw fail(throwable);
+        }
+    }
+
+    public void send(MemorySegment self, long a, long b, long c, long d, long e, long f, long g, long h) {
+        try {
+            handle.invokeExact(self, sel, a, b, c, d, e, f, g, h);
         } catch (Throwable throwable) {
             throw fail(throwable);
         }

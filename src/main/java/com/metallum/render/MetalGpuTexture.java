@@ -62,8 +62,9 @@ final class MetalGpuTexture extends GpuTexture {
             descriptor.storageMode(MTLStorageMode.Private);
             descriptor.hazardTrackingMode(MTLHazardTrackingMode.Untracked);
             this.nativeHandle = device.metalDevice().newTexture(descriptor);
+            device.trackAllocation(this.nativeHandle);
         }
-        if (label != null) {
+        if (label != null && !label.isEmpty()) {
             MemorySegment nsLabel = ObjC.nsString(label);
             SET_LABEL.send(this.nativeHandle, nsLabel);
             ObjC.release(nsLabel);
@@ -116,7 +117,7 @@ final class MetalGpuTexture extends GpuTexture {
         if (this.closed && this.views == 0 && this.nativeHandle != null) {
             MemorySegment handle = this.nativeHandle;
             this.nativeHandle = null;
-            this.device.queueResourceRelease(handle);
+            this.device.queueAllocationRelease(handle);
         }
     }
 

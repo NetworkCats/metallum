@@ -22,9 +22,14 @@ public final class MTLBlitCommandEncoder extends MTLCommandEncoder {
             ADDRESS, JAVA_LONG, JAVA_LONG, ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, JAVA_LONG, JAVA_LONG);
     private static final Msg UPDATE_FENCE = Msg.ofVoid("updateFence:", ADDRESS);
     private static final Msg WAIT_FOR_FENCE = Msg.ofVoid("waitForFence:", ADDRESS);
+    private static final Msg MTL4_UPDATE_FENCE =
+            Msg.ofVoid("updateFence:afterEncoderStages:", ADDRESS, JAVA_LONG);
+    private static final Msg MTL4_WAIT_FOR_FENCE =
+            Msg.ofVoid("waitForFence:beforeEncoderStages:", ADDRESS, JAVA_LONG);
+    private static final long MTL_STAGE_BLIT = 1L << 28;
 
-    MTLBlitCommandEncoder(final MemorySegment handle) {
-        super(handle);
+    MTLBlitCommandEncoder(final MemorySegment handle, final boolean metal4) {
+        super(handle, metal4);
     }
 
     public void copyFromBufferToBuffer(
@@ -126,10 +131,18 @@ public final class MTLBlitCommandEncoder extends MTLCommandEncoder {
     }
 
     public void updateFence(final MTLFence fence) {
-        UPDATE_FENCE.send(handle(), fence.handle());
+        if (this.metal4) {
+            MTL4_UPDATE_FENCE.send(handle(), fence.handle(), MTL_STAGE_BLIT);
+        } else {
+            UPDATE_FENCE.send(handle(), fence.handle());
+        }
     }
 
     public void waitForFence(final MTLFence fence) {
-        WAIT_FOR_FENCE.send(handle(), fence.handle());
+        if (this.metal4) {
+            MTL4_WAIT_FOR_FENCE.send(handle(), fence.handle(), MTL_STAGE_BLIT);
+        } else {
+            WAIT_FOR_FENCE.send(handle(), fence.handle());
+        }
     }
 }

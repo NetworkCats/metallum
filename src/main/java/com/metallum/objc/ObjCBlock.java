@@ -7,6 +7,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
+import java.util.function.Consumer;
 
 import static java.lang.foreign.ValueLayout.*;
 
@@ -18,6 +19,7 @@ public final class ObjCBlock {
     private static final Arena BLOCK_ARENA = Arena.global();
     private static final MemorySegment BLOCK_DESCRIPTOR;
     private static final MethodHandle INVOKE_RUNNABLE;
+    private static final MethodHandle INVOKE_CONSUMER;
 
     static {
         BLOCK_DESCRIPTOR = BLOCK_ARENA.allocate(16, 8);
@@ -29,6 +31,11 @@ public final class ObjCBlock {
                     "invokeRunnable",
                     MethodType.methodType(void.class, Runnable.class, MemorySegment.class, MemorySegment.class)
             );
+            INVOKE_CONSUMER = MethodHandles.lookup().findStatic(
+                    ObjCBlock.class,
+                    "invokeConsumer",
+                    MethodType.methodType(void.class, Consumer.class, MemorySegment.class, MemorySegment.class)
+            );
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("Failed to resolve block invoke handle", e);
         }
@@ -39,7 +46,20 @@ public final class ObjCBlock {
 
     public static MemorySegment withRunnable(final Runnable action) {
         MethodHandle target = MethodHandles.insertArguments(INVOKE_RUNNABLE, 0, action);
-        MemorySegment invoke = ObjC.LINKER.upcallStub(target, FunctionDescriptor.ofVoid(ADDRESS, ADDRESS), BLOCK_ARENA);
+        return createBlock(target);
+    }
+
+    public static MemorySegment withConsumer(final Consumer<MemorySegment> action) {
+        MethodHandle target = MethodHandles.insertArguments(INVOKE_CONSUMER, 0, action);
+        return createBlock(target);
+    }
+
+    private static MemorySegment createBlock(final MethodHandle target) {
+        MemorySegment invoke = ObjC.LINKER.upcallStub(
+                target,
+                FunctionDescriptor.ofVoid(ADDRESS, ADDRESS),
+                BLOCK_ARENA
+        );
 
         MemorySegment block = BLOCK_ARENA.allocate(32, 8);
         block.set(ADDRESS, 0, NS_CONCRETE_GLOBAL_BLOCK);
@@ -52,5 +72,13 @@ public final class ObjCBlock {
 
     private static void invokeRunnable(final Runnable action, final MemorySegment block, final MemorySegment argument) {
         action.run();
+    }
+
+    private static void invokeConsumer(
+            final Consumer<MemorySegment> action,
+            final MemorySegment block,
+            final MemorySegment argument
+    ) {
+        action.accept(argument);
     }
 }

@@ -13,6 +13,7 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
 public final class MTLBuffer {
     private static final Msg CONTENTS = Msg.of("contents", ADDRESS);
     private static final Msg LENGTH = Msg.of("length", JAVA_LONG);
+    private static final Msg GPU_ADDRESS = Msg.of("gpuAddress", JAVA_LONG);
 
     private final MemorySegment handle;
 
@@ -33,5 +34,9 @@ public final class MTLBuffer {
 
     public long length() {
         return LENGTH.sendLong(handle);
+    }
+
+    public long gpuAddress() {
+        return GPU_ADDRESS.sendLong(handle);
     }
 }

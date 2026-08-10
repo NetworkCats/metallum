@@ -38,11 +38,12 @@ class MetalGpuBuffer extends GpuBuffer {
         this.resourceOptions = toMtlResourceOptions(usage);
         this.allocationSize = (size + 15L) & ~15L;
         this.nativeBuffer = device.metalDevice().newBuffer(this.allocationSize, this.resourceOptions);
+        device.trackAllocation(this.nativeBuffer.handle());
 
         if (this.cpuAccessible) {
             MemorySegment contents = this.nativeBuffer.contents();
             if (ObjC.isNil(contents)) {
-                ObjC.release(this.nativeBuffer.handle());
+                this.device.releaseAllocationNow(this.nativeBuffer.handle());
                 this.nativeBuffer = null;
                 throw new IllegalStateException("MTLBuffer.contents returned null");
             }
@@ -126,7 +127,7 @@ class MetalGpuBuffer extends GpuBuffer {
         if (this.nativeBuffer != null) {
             MemorySegment handle = this.nativeBuffer.handle();
             this.nativeBuffer = null;
-            this.device.queueResourceRelease(handle);
+            this.device.queueAllocationRelease(handle);
         }
     }
 

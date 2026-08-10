@@ -6,6 +6,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
+import static java.lang.foreign.ValueLayout.JAVA_BOOLEAN;
 
 public final class ObjC {
     public static final Linker LINKER = Linker.nativeLinker();
@@ -38,6 +39,9 @@ public final class ObjC {
     private static final MemorySegment SEL_UTF8_STRING = selector("UTF8String");
     private static final MethodHandle MSG_GET_PTR = msgSendCritical(FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS));
     private static final MethodHandle MSG_PTR_ARG = msgSendCritical(FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, ADDRESS));
+    private static final MethodHandle MSG_RESPONDS_TO_SELECTOR =
+            msgSendCritical(FunctionDescriptor.of(JAVA_BOOLEAN, ADDRESS, ADDRESS, ADDRESS));
+    private static final MemorySegment SEL_RESPONDS_TO_SELECTOR = selector("respondsToSelector:");
 
     private ObjC() {
     }
@@ -113,14 +117,33 @@ public final class ObjC {
     }
 
     public static MemorySegment clazz(String name) {
+        MemorySegment cls = findClass(name);
+        if (isNil(cls)) {
+            throw new IllegalStateException("Objective-C class not found: " + name + " (framework not loaded?)");
+        }
+        return cls;
+    }
+
+    public static MemorySegment findClass(String name) {
         try (Arena arena = Arena.ofConfined()) {
-            MemorySegment cls = (MemorySegment) OBJC_GET_CLASS.invokeExact(arena.allocateFrom(name));
-            if (cls.equals(MemorySegment.NULL)) {
-                throw new IllegalStateException("Objective-C class not found: " + name + " (framework not loaded?)");
-            }
-            return cls;
+            return (MemorySegment) OBJC_GET_CLASS.invokeExact(arena.allocateFrom(name));
         } catch (Throwable throwable) {
             throw new AssertionError("objc_getClass failed for " + name, throwable);
+        }
+    }
+
+    public static boolean respondsToSelector(MemorySegment object, String selectorName) {
+        if (isNil(object)) {
+            return false;
+        }
+        try {
+            return (boolean) MSG_RESPONDS_TO_SELECTOR.invokeExact(
+                    object,
+                    SEL_RESPONDS_TO_SELECTOR,
+                    selector(selectorName)
+            );
+        } catch (Throwable throwable) {
+            throw new AssertionError("respondsToSelector: failed for " + selectorName, throwable);
         }
     }
 

@@ -31,7 +31,9 @@ import java.util.regex.Pattern;
 @Environment(EnvType.CLIENT)
 final class MetalCrossShaderCompiler {
     private static final Set<String> BUILT_IN_UNIFORMS = Set.of("Projection", "Lighting", "Fog", "Globals");
-    private static final int MSL_VERSION_4_0 = 0x040000;
+    // SPIRV-Cross encodes MSL versions as major * 10000 + minor * 100 + patch.
+    private static final int MSL_VERSION_3_0 = 30_000;
+    private static final int MSL_VERSION_4_0 = 40_000;
     private static final Pattern VERTEX_ENTRY_PATTERN = Pattern.compile("\\bvertex\\s+\\w+\\s+(\\w+)\\s*\\(");
     private static final Pattern FRAGMENT_ENTRY_PATTERN = Pattern.compile("\\bfragment\\s+\\w+\\s+(\\w+)\\s*\\(");
 
@@ -54,11 +56,24 @@ final class MetalCrossShaderCompiler {
             List<String> vertexOutputs = extractVariableNames(vertexSpirv.outputs());
 
             vertexSpirv.rebind(tolerateUnprovidedInputs(MetalPipelineSupport.vertexAttributeNames(pipeline), vertexSpirv.inputs()), layoutEntries);
-            MslShader vertexMsl = spirvToMsl(vertexSpirv.spirv(), layoutEntries.size(), vertexAttributeFormats(pipeline), true);
+            int mslVersion = device.usesMetal4CommandPath() ? MSL_VERSION_4_0 : MSL_VERSION_3_0;
+            MslShader vertexMsl = spirvToMsl(
+                    vertexSpirv.spirv(),
+                    layoutEntries.size(),
+                    vertexAttributeFormats(pipeline),
+                    true,
+                    mslVersion
+            );
 
             boolean enableFragDepth = pipeline.getDepthStencilState() != null;
             fragmentSpirv.rebind(tolerateUnprovidedInputs(vertexOutputs, fragmentSpirv.inputs()), layoutEntries);
-            MslShader fragmentMsl = spirvToMsl(fragmentSpirv.spirv(), layoutEntries.size(), Map.of(), enableFragDepth);
+            MslShader fragmentMsl = spirvToMsl(
+                    fragmentSpirv.spirv(),
+                    layoutEntries.size(),
+                    Map.of(),
+                    enableFragDepth,
+                    mslVersion
+            );
 
             String vertexEntryPoint = extractEntryPoint(vertexMsl.source(), VERTEX_ENTRY_PATTERN, "main0");
             String fragmentEntryPoint = extractEntryPoint(fragmentMsl.source(), FRAGMENT_ENTRY_PATTERN, "main0");
@@ -283,7 +298,8 @@ final class MetalCrossShaderCompiler {
             final ByteBuffer spirvBytes,
             final int pushConstantBinding,
             final Map<String, GpuFormat> attributeFormats,
-            final boolean enableFragDepth
+            final boolean enableFragDepth,
+            final int mslVersion
     ) throws ShaderCompileException {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             IntBuffer spirvWords = spirvBytes.asIntBuffer();
@@ -310,7 +326,7 @@ final class MetalCrossShaderCompiler {
                         "spvc_compiler_options_set_uint(MSL_PLATFORM)"
                 );
                 checkSpvc(
-                        Spvc.spvc_compiler_options_set_uint(options, Spvc.SPVC_COMPILER_OPTION_MSL_VERSION, MSL_VERSION_4_0),
+                        Spvc.spvc_compiler_options_set_uint(options, Spvc.SPVC_COMPILER_OPTION_MSL_VERSION, mslVersion),
                         "spvc_compiler_options_set_uint(MSL_VERSION)"
                 );
                 checkSpvc(

@@ -31,10 +31,16 @@ public record MTLDevice(MemorySegment handle) {
     private static final Msg NEW_FUNCTION_WITH_NAME = Msg.of("newFunctionWithName:", true, ADDRESS, ADDRESS);
     private static final Msg NEW_RENDER_PIPELINE_STATE = Msg.of("newRenderPipelineStateWithDescriptor:error:", true, ADDRESS, ADDRESS, ADDRESS);
     private static final Msg LOCALIZED_DESCRIPTION = Msg.of("localizedDescription", ADDRESS);
-    private static final Msg MINIMUM_LINEAR_TEXTURE_ALIGNMENT = Msg.of("minimumLinearTextureAlignmentForPixelFormat:", JAVA_LONG, JAVA_LONG);
+    private static final Msg MINIMUM_TEXTURE_BUFFER_ALIGNMENT =
+            Msg.of("minimumTextureBufferAlignmentForPixelFormat:", JAVA_LONG, JAVA_LONG);
     private static final Msg NAME = Msg.of("name", ADDRESS);
     private static final Msg MAX_BUFFER_LENGTH = Msg.of("maxBufferLength", JAVA_LONG);
     private static final Msg RECOMMENDED_MAX_WORKING_SET_SIZE = Msg.of("recommendedMaxWorkingSetSize", JAVA_LONG);
+    private static final Msg SET_MAXIMIZE_CONCURRENT_COMPILATION =
+            Msg.ofVoid("setShouldMaximizeConcurrentCompilation:", java.lang.foreign.ValueLayout.JAVA_BOOLEAN);
+
+    private static final String METAL_4_QUEUE_SELECTOR = "newMTL4CommandQueue";
+    private static final String CONCURRENT_COMPILATION_SELECTOR = "setShouldMaximizeConcurrentCompilation:";
 
     public MTLDevice {
         if (handle == null || handle.address() == 0L) {
@@ -66,6 +72,18 @@ public record MTLDevice(MemorySegment handle) {
         return RECOMMENDED_MAX_WORKING_SET_SIZE.sendLong(handle);
     }
 
+    public boolean supportsMetal4() {
+        return ObjC.respondsToSelector(handle, METAL_4_QUEUE_SELECTOR);
+    }
+
+    public boolean enableConcurrentCompilation() {
+        if (!ObjC.respondsToSelector(handle, CONCURRENT_COMPILATION_SELECTOR)) {
+            return false;
+        }
+        SET_MAXIMIZE_CONCURRENT_COMPILATION.send(handle, true);
+        return true;
+    }
+
     public MTLBuffer newBuffer(final long length, final long options) {
         MemorySegment buffer = NEW_BUFFER.sendPtr(handle, length, options);
         if (ObjC.isNil(buffer)) {
@@ -74,12 +92,18 @@ public record MTLDevice(MemorySegment handle) {
         return new MTLBuffer(buffer);
     }
 
-    public MTLCommandQueue newCommandQueue() {
+    public MTLCommandQueue newCommandQueue(final boolean preferMetal4) {
+        if (preferMetal4) {
+            MTLCommandQueue metal4Queue = MTLCommandQueue.tryCreateMetal4(this);
+            if (metal4Queue != null) {
+                return metal4Queue;
+            }
+        }
         MemorySegment queue = NEW_COMMAND_QUEUE.sendPtr(handle);
         if (ObjC.isNil(queue)) {
             throw new IllegalStateException("newCommandQueue returned nil");
         }
-        return new MTLCommandQueue(queue);
+        return MTLCommandQueue.legacy(this, queue);
     }
 
     public MemorySegment newTexture(final MTLTextureDescriptor descriptor) {
@@ -115,19 +139,44 @@ public record MTLDevice(MemorySegment handle) {
     }
 
     public MemorySegment newFunction(final String mslSource, final String entryPoint) {
+        MemorySegment library = newLibrary(mslSource);
+        if (ObjC.isNil(library)) {
+            return MemorySegment.NULL;
+        }
+        try {
+            return newFunction(library, entryPoint);
+        } finally {
+            ObjC.release(library);
+        }
+    }
+
+    public MemorySegment newLibrary(final String mslSource) {
         try (AutoreleasePool _ = AutoreleasePool.push(); Arena arena = Arena.ofConfined()) {
             MemorySegment errorOut = arena.allocate(ADDRESS);
             MemorySegment nsSource = ObjC.nsString(mslSource);
-            MemorySegment library = NEW_LIBRARY_WITH_SOURCE.sendPtr(handle, nsSource, MemorySegment.NULL, errorOut);
-            ObjC.release(nsSource);
+            MemorySegment library;
+            try {
+                library = NEW_LIBRARY_WITH_SOURCE.sendPtr(handle, nsSource, MemorySegment.NULL, errorOut);
+            } finally {
+                ObjC.release(nsSource);
+            }
             if (ObjC.isNil(library)) {
                 Metallum.LOGGER.error("[metallum] Failed to compile MSL: {}", errorDescription(errorOut));
                 return MemorySegment.NULL;
             }
+            return library;
+        }
+    }
+
+    public MemorySegment newFunction(final MemorySegment library, final String entryPoint) {
+        try (AutoreleasePool _ = AutoreleasePool.push()) {
             MemorySegment nsEntry = ObjC.nsString(entryPoint);
-            MemorySegment function = NEW_FUNCTION_WITH_NAME.sendPtr(library, nsEntry);
-            ObjC.release(nsEntry);
-            ObjC.release(library);
+            MemorySegment function;
+            try {
+                function = NEW_FUNCTION_WITH_NAME.sendPtr(library, nsEntry);
+            } finally {
+                ObjC.release(nsEntry);
+            }
             if (ObjC.isNil(function)) {
                 Metallum.LOGGER.error("[metallum] Failed to resolve MSL entry point '{}'", entryPoint);
                 return MemorySegment.NULL;
@@ -148,8 +197,8 @@ public record MTLDevice(MemorySegment handle) {
         }
     }
 
-    static long minimumLinearTextureAlignment(final MemorySegment device, final long pixelFormat) {
-        return MINIMUM_LINEAR_TEXTURE_ALIGNMENT.sendLong(device, pixelFormat);
+    static long minimumTextureBufferAlignment(final MemorySegment device, final long pixelFormat) {
+        return MINIMUM_TEXTURE_BUFFER_ALIGNMENT.sendLong(device, pixelFormat);
     }
 
     private static String errorDescription(final MemorySegment errorOut) {

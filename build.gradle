@@ -11,7 +11,7 @@ loom {
 }
 
 repositories {
-	maven { url "https://api.modrinth.com/maven" }
+	maven { url = "https://api.modrinth.com/maven" }
 }
 
 dependencies {
@@ -40,11 +40,13 @@ java {
 	targetCompatibility = JavaVersion.VERSION_25
 }
 
+def archiveProjectName = project.name
+
 jar {
-	inputs.property "projectName", project.name
+	inputs.property "projectName", archiveProjectName
 
 	from("LICENSE") {
-		rename { "${it}_${project.name}"}
+		rename { "${it}_${archiveProjectName}"}
 	}
 }
 

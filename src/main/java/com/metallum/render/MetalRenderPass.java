@@ -183,6 +183,9 @@ final class MetalRenderPass implements RenderPassBackend {
 
     @Override
     public void drawIndexed(final int indexCount, final int instanceCount, final int firstIndex, final int vertexOffset, final int firstInstance) {
+        if (indexCount <= 0 || instanceCount <= 0) {
+            return;
+        }
         MetalGpuBuffer nativeIndexBuffer = (MetalGpuBuffer) indexBuffer;
         MTLRenderCommandEncoder enc = renderEncoder();
 
@@ -192,14 +195,19 @@ final class MetalRenderPass implements RenderPassBackend {
 
     @Override
     public void multiDrawIndexed(@NonNull IntBuffer drawParameters, int instanceCount, int firstInstance, int drawCount) {
+        if (instanceCount <= 0 || drawCount <= 0) {
+            return;
+        }
         MetalGpuBuffer nativeIndexBuffer = (MetalGpuBuffer) indexBuffer;
         MTLRenderCommandEncoder enc = renderEncoder();
         bindDrawState(enc);
 
+        int parameterBase = drawParameters.position();
         for (int i = 0; i < drawCount; i++) {
-            int firstIndex = drawParameters.get(i * 3);
-            int indexCount = drawParameters.get(i * 3 + 1);
-            int baseVertex = drawParameters.get(i * 3 + 2);
+            int offset = parameterBase + i * 3;
+            int firstIndex = drawParameters.get(offset);
+            int indexCount = drawParameters.get(offset + 1);
+            int baseVertex = drawParameters.get(offset + 2);
             if (indexCount > 0) {
                 drawIndexedNative(enc, nativeIndexBuffer, firstIndex, indexCount, baseVertex, instanceCount, indexType, firstInstance);
             }
@@ -208,10 +216,10 @@ final class MetalRenderPass implements RenderPassBackend {
 
     @Override
     public void multiDrawIndexed(@NonNull PointerBuffer firstIndexOffsets, @NonNull IntBuffer indexCounts, @NonNull IntBuffer vertexOffsets, int drawCount) {
-        MTLPrimitiveType primitiveType = primitiveTopology();
-        if (primitiveType == MTLPrimitiveType.TriangleFan) {
-            throw new UnsupportedOperationException("Metal backend does not support triangle fan multiDrawIndexed");
+        if (drawCount <= 0) {
+            return;
         }
+        MTLPrimitiveType primitiveType = primitiveTopology();
 
         MetalGpuBuffer nativeIndexBuffer = (MetalGpuBuffer) indexBuffer;
         MTLRenderCommandEncoder enc = renderEncoder();
@@ -228,12 +236,23 @@ final class MetalRenderPass implements RenderPassBackend {
             }
             long firstIndexOffset = offsets.get(ValueLayout.JAVA_LONG, i * 8L);
             int baseVertex = vertices.get(ValueLayout.JAVA_INT, i * 4L);
-            enc.drawIndexedPrimitives(primitiveType, indexCount, indexType, indexBufferHandle, firstIndexOffset, 1, baseVertex, 0);
+            if (primitiveType == MTLPrimitiveType.TriangleFan) {
+                if (firstIndexOffset < 0L || firstIndexOffset % indexType.bytes != 0L) {
+                    throw new IllegalArgumentException("Triangle fan index offset is not aligned to the index type: " + firstIndexOffset);
+                }
+                int firstIndex = Math.toIntExact(firstIndexOffset / indexType.bytes);
+                drawIndexedNative(enc, nativeIndexBuffer, firstIndex, indexCount, baseVertex, 1, indexType, 0);
+            } else {
+                enc.drawIndexedPrimitives(primitiveType, indexCount, indexType, indexBufferHandle, firstIndexOffset, 1, baseVertex, 0);
+            }
         }
     }
 
     @Override
     public void drawIndexedIndirect(final @NonNull GpuBufferSlice commands, final int drawCount) {
+        if (drawCount <= 0) {
+            return;
+        }
         MTLPrimitiveType primitiveType = primitiveTopology();
         if (primitiveType == MTLPrimitiveType.TriangleFan) {
             throw new UnsupportedOperationException("Metal backend does not support triangle fan indirect draws");
@@ -284,6 +303,9 @@ final class MetalRenderPass implements RenderPassBackend {
 
     @Override
     public void draw(final int vertexCount, final int instanceCount, final int firstVertex, final int firstInstance) {
+        if (vertexCount <= 0 || instanceCount <= 0) {
+            return;
+        }
         MTLPrimitiveType primitiveType = primitiveTopology();
         MTLRenderCommandEncoder enc = renderEncoder();
 
@@ -292,22 +314,67 @@ final class MetalRenderPass implements RenderPassBackend {
         if (primitiveType == MTLPrimitiveType.TriangleFan) {
             drawTriangleFan(enc, firstVertex, vertexCount, instanceCount, firstInstance);
         } else {
-            enc.drawPrimitives(primitiveType, firstVertex, vertexCount, Math.max(1, instanceCount), firstInstance);
+            enc.drawPrimitives(primitiveType, firstVertex, vertexCount, instanceCount, firstInstance);
         }
     }
 
     @Override
     public void multiDraw(@NonNull IntBuffer drawParameters, int instanceCount, int firstInstance, int drawCount) {
-        throw new UnsupportedOperationException();
+        if (instanceCount <= 0 || drawCount <= 0) {
+            return;
+        }
+
+        MTLPrimitiveType primitiveType = primitiveTopology();
+        MTLRenderCommandEncoder enc = renderEncoder();
+        bindDrawState(enc);
+
+        int parameterBase = drawParameters.position();
+        for (int i = 0; i < drawCount; i++) {
+            int offset = parameterBase + i * 2;
+            int firstVertex = drawParameters.get(offset);
+            int vertexCount = drawParameters.get(offset + 1);
+            if (vertexCount <= 0) {
+                continue;
+            }
+            if (primitiveType == MTLPrimitiveType.TriangleFan) {
+                drawTriangleFan(enc, firstVertex, vertexCount, instanceCount, firstInstance);
+            } else {
+                enc.drawPrimitives(primitiveType, firstVertex, vertexCount, instanceCount, firstInstance);
+            }
+        }
     }
 
     @Override
     public void multiDraw(@NonNull IntBuffer firstVertices, @NonNull IntBuffer vertexCounts, int drawCount) {
-        throw new UnsupportedOperationException();
+        if (drawCount <= 0) {
+            return;
+        }
+
+        MTLPrimitiveType primitiveType = primitiveTopology();
+        MTLRenderCommandEncoder enc = renderEncoder();
+        bindDrawState(enc);
+
+        int firstVertexBase = firstVertices.position();
+        int vertexCountBase = vertexCounts.position();
+        for (int i = 0; i < drawCount; i++) {
+            int vertexCount = vertexCounts.get(vertexCountBase + i);
+            if (vertexCount <= 0) {
+                continue;
+            }
+            int firstVertex = firstVertices.get(firstVertexBase + i);
+            if (primitiveType == MTLPrimitiveType.TriangleFan) {
+                drawTriangleFan(enc, firstVertex, vertexCount, 1, 0);
+            } else {
+                enc.drawPrimitives(primitiveType, firstVertex, vertexCount, 1, 0);
+            }
+        }
     }
 
     @Override
     public void drawIndirect(final @NonNull GpuBufferSlice commands, final int drawCount) {
+        if (drawCount <= 0) {
+            return;
+        }
         MTLPrimitiveType primitiveType = primitiveTopology();
         if (primitiveType == MTLPrimitiveType.TriangleFan) {
             throw new UnsupportedOperationException("Metal backend does not support triangle fan indirect draws");
@@ -400,6 +467,9 @@ final class MetalRenderPass implements RenderPassBackend {
     }
 
     private void drawTriangleFan(MTLRenderCommandEncoder encoder, final int firstVertex, final int vertexCount, final int instanceCount, final int baseInstance) {
+        if (vertexCount < 3 || instanceCount <= 0) {
+            return;
+        }
         int triangleCount = vertexCount - 2;
         int indexCount = triangleCount * 3;
         MTLIndexType fanIndexType = vertexCount - 1 <= 0xFFFF ? MTLIndexType.UInt16 : MTLIndexType.UInt32;
@@ -421,7 +491,7 @@ final class MetalRenderPass implements RenderPassBackend {
                 }
             }
             GpuBufferSlice slice = mapped.slice();
-            encoder.drawIndexedPrimitives(MTLPrimitiveType.Triangle, indexCount, fanIndexType, ((MetalGpuBuffer) slice.buffer()).metalBuffer(), slice.offset(), Math.max(1, instanceCount), firstVertex, baseInstance);
+            encoder.drawIndexedPrimitives(MTLPrimitiveType.Triangle, indexCount, fanIndexType, ((MetalGpuBuffer) slice.buffer()).metalBuffer(), slice.offset(), instanceCount, firstVertex, baseInstance);
         }
     }
 
@@ -435,6 +505,9 @@ final class MetalRenderPass implements RenderPassBackend {
             final MTLIndexType indexType,
             final int baseInstance
     ) {
+        if (indexCount <= 0 || instanceCount <= 0) {
+            return;
+        }
         MTLPrimitiveType primitiveType = primitiveTopology();
 
         long indexOffsetBytes = (long) firstIndex * indexType.bytes;
