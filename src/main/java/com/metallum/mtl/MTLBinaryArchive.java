@@ -23,7 +23,10 @@ public final class MTLBinaryArchive implements AutoCloseable {
     private static final MemorySegment URL_CLASS = ObjC.findClass("NSURL");
     private static final Msg NEW = Msg.of("new", ADDRESS);
     private static final Msg FILE_URL = Msg.of("fileURLWithPath:", ADDRESS, ADDRESS);
-    private static final Msg SET_URL = Msg.ofVoid("setURL:", ADDRESS);
+    // The Objective-C property is named `url`, so its setter is `setUrl:`.
+    // Sending `setURL:` raises an NSInvalidArgumentException which cannot be
+    // recovered on the Java side.
+    private static final Msg SET_URL = Msg.ofVoid("setUrl:", ADDRESS);
     private static final Msg CREATE = Msg.of(
             "newBinaryArchiveWithDescriptor:error:", true, ADDRESS, ADDRESS, ADDRESS);
     private static final Msg ADD_RENDER_PIPELINE = Msg.of(
@@ -63,7 +66,7 @@ public final class MTLBinaryArchive implements AutoCloseable {
                 return MemorySegment.NULL;
             }
             try {
-                if (path != null) {
+                if (path != null && ObjC.respondsToSelector(descriptor, "setUrl:")) {
                     SET_URL.send(descriptor, fileUrl(path));
                 }
                 MemorySegment error = arena.allocate(ADDRESS);

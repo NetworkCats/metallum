@@ -30,6 +30,9 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
     static final long STAGE_VERTEX = 1L;
     static final long STAGE_FRAGMENT = 1L << 1;
     static final long STAGE_BLIT = 1L << 28;
+    // The tracker performs fine-grained synchronization inside a submission and
+    // preserves ordering across submission boundaries. Keep the global fence path
+    // available as a conservative diagnostics fallback.
     private static final boolean RESOURCE_TRACKER_ENABLED =
             !Boolean.getBoolean("metallum.globalFence")
                     && !"false".equalsIgnoreCase(System.getProperty("metallum.resourceTracker"));
@@ -48,6 +51,13 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
     private long activeEncoderId = -1L;
     @Nullable
     private MTLFence activeDependencyFence;
+    @Nullable
+    private MTLFence previousSubmissionFence;
+    @Nullable
+    private MTLFence currentSubmissionLastFence;
+    private long previousSubmissionStages;
+    private long currentSubmissionStages;
+    private boolean currentSubmissionHasEncoder;
     @Nullable
     private MetalRenderPass currentRenderPass;
     @Nullable
@@ -103,8 +113,8 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
     void endEncoder() {
         if (currentEncoder != null) {
             if (currentEncoder instanceof MTLRenderCommandEncoder renderEncoder) {
-                if (trackerEnabled() && !renderEncoder.isMetal4()) {
-                    updateTrackedRenderFence(renderEncoder);
+                if (trackerEnabled()) {
+                    finishTrackedRenderEncoder(renderEncoder);
                 } else if (!trackerEnabled()) {
                     renderEncoder.updateFence(fence, MTLRenderStages.VertexAndFragment);
                     Stats.increment(Stats.Counter.FENCE_UPDATES);
@@ -113,11 +123,8 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
                     currentRenderPass.invalidateEncoderState();
                 }
             } else if (currentEncoder instanceof MTLBlitCommandEncoder blitEncoder) {
-                if (trackerEnabled() && !blitEncoder.isMetal4()) {
-                    if (this.accessTracker.stagesForEncoder(this.activeEncoderId) != 0L) {
-                        blitEncoder.updateFence(requireActiveDependencyFence());
-                        Stats.increment(Stats.Counter.FENCE_UPDATES);
-                    }
+                if (trackerEnabled()) {
+                    finishTrackedBlitEncoder(blitEncoder);
                 } else if (!trackerEnabled()) {
                     blitEncoder.updateFence(fence);
                     Stats.increment(Stats.Counter.FENCE_UPDATES);
@@ -153,6 +160,7 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             toClose = inFlight[slot];
             inFlight[slot] = new InFlight(currentSubmitIndex, commandBuffer);
             commandBuffer = null;
+            finishTrackedSubmission();
         }
         currentSubmitIndex++;
 
@@ -169,7 +177,6 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         transientMemory.rotate();
         destroyQueue.rotate();
         accessTracker.reset();
-        Stats.endFrame();
 
         if (commandError != null) {
             device.recordCommandError(commandError);
@@ -735,6 +742,10 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         if (!trackerEnabled()) {
             return;
         }
+        if (!this.currentSubmissionHasEncoder) {
+            waitForPreviousSubmission(encoder);
+            this.currentSubmissionHasEncoder = true;
+        }
         this.activeEncoderId = this.accessTracker.beginEncoder();
         this.activeDependencyFence = encoder.isMetal4()
                 ? null
@@ -814,21 +825,84 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         if (this.currentEncoder != encoder) {
             throw new IllegalStateException("Unexpected external Metal encoder completion");
         }
-        if (!encoder.isMetal4()) {
-            updateTrackedRenderFence(encoder);
-        }
+        finishTrackedRenderEncoder(encoder);
         this.currentEncoder = null;
         this.activeEncoderId = -1L;
         this.activeDependencyFence = null;
     }
 
-    private void updateTrackedRenderFence(final MTLRenderCommandEncoder encoder) {
+    private void finishTrackedRenderEncoder(final MTLRenderCommandEncoder encoder) {
         long stages = this.accessTracker.stagesForEncoder(this.activeEncoderId);
         if (stages == 0L) {
             return;
         }
-        encoder.updateFence(requireActiveDependencyFence(), renderStages(stages));
-        Stats.increment(Stats.Counter.FENCE_UPDATES);
+        this.currentSubmissionStages |= stages;
+        if (!encoder.isMetal4()) {
+            MTLFence dependencyFence = requireActiveDependencyFence();
+            encoder.updateFence(dependencyFence, renderStages(stages));
+            this.currentSubmissionLastFence = dependencyFence;
+            Stats.increment(Stats.Counter.FENCE_UPDATES);
+        }
+    }
+
+    private void finishTrackedBlitEncoder(final MTLBlitCommandEncoder encoder) {
+        long stages = this.accessTracker.stagesForEncoder(this.activeEncoderId);
+        if (stages == 0L) {
+            return;
+        }
+        this.currentSubmissionStages |= stages;
+        if (!encoder.isMetal4()) {
+            MTLFence dependencyFence = requireActiveDependencyFence();
+            encoder.updateFence(dependencyFence);
+            this.currentSubmissionLastFence = dependencyFence;
+            Stats.increment(Stats.Counter.FENCE_UPDATES);
+        }
+    }
+
+    private void waitForPreviousSubmission(final MTLCommandEncoder encoder) {
+        if (encoder.isMetal4()) {
+            if (this.previousSubmissionStages != 0L) {
+                long consumerStages = encoder instanceof MTLRenderCommandEncoder
+                        ? STAGE_VERTEX | STAGE_FRAGMENT
+                        : STAGE_BLIT;
+                encoder.barrierAfterQueueStages(
+                        this.previousSubmissionStages,
+                        consumerStages,
+                        true
+                );
+                Stats.increment(Stats.Counter.BARRIERS);
+            }
+            return;
+        }
+        if (this.previousSubmissionFence == null) {
+            return;
+        }
+        if (encoder instanceof MTLRenderCommandEncoder renderEncoder) {
+            renderEncoder.waitForFence(
+                    this.previousSubmissionFence,
+                    MTLRenderStages.VertexAndFragment
+            );
+        } else if (encoder instanceof MTLBlitCommandEncoder blitEncoder) {
+            blitEncoder.waitForFence(this.previousSubmissionFence);
+        } else {
+            throw new IllegalStateException("Unsupported Metal encoder at submission boundary");
+        }
+        Stats.increment(Stats.Counter.FENCE_WAITS);
+    }
+
+    private void finishTrackedSubmission() {
+        if (!trackerEnabled()) {
+            return;
+        }
+        if (this.currentSubmissionStages != 0L) {
+            this.previousSubmissionStages = this.currentSubmissionStages;
+            if (this.currentSubmissionLastFence != null) {
+                this.previousSubmissionFence = this.currentSubmissionLastFence;
+            }
+        }
+        this.currentSubmissionStages = 0L;
+        this.currentSubmissionLastFence = null;
+        this.currentSubmissionHasEncoder = false;
     }
 
     private static MTLRenderStages renderStages(final long stages) {

@@ -247,7 +247,8 @@ final class MetalRenderPass implements RenderPassBackend {
         MTLRenderCommandEncoder enc = renderEncoder();
         bindDrawState(enc);
         trackIndexBuffer(nativeIndexBuffer);
-        if (!batch.execute(this.device, enc, primitiveTopology(), this.indexType, nativeIndexBuffer)) {
+        if (!this.compiledPipeline.supportsIndirectCommands()
+                || !batch.execute(this.device, enc, primitiveTopology(), this.indexType, nativeIndexBuffer)) {
             batch.drawFallback(this);
         }
     }

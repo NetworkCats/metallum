@@ -63,7 +63,12 @@ final class MetalSurface implements GpuSurfaceBackend {
 
     @Override
     public void present() {
-        pendingPresentEncoder.submit();
+        if (this.pendingPresentEncoder == null) {
+            throw new IllegalStateException("Metal surface has no pending presentation");
+        }
+        this.pendingPresentEncoder.submit();
+        this.pendingPresentEncoder = null;
+        Stats.endFrame();
     }
 
     @Override

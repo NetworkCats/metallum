@@ -48,6 +48,7 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
     private final float depthBiasConstant;
     private final MTLPrimitiveType topology;
     private final int vertexBufferCount;
+    private final boolean supportsIndirectCommands;
 
     private final MemorySegment depthStencilState;
     private final MemorySegment withDepthPipeline;
@@ -86,6 +87,10 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
         this.fillMode = info.getPolygonMode() == PolygonMode.WIREFRAME ? MTLTriangleFillMode.Lines : MTLTriangleFillMode.Fill;
         this.topology = MTLPrimitiveType.from(info.getPrimitiveTopology());
         this.vertexBufferCount = info.getVertexFormatBindings().length;
+        // MultiDrawBatch is a Sodium terrain facility. Other Minecraft pipelines
+        // must not opt into ICB support, and Sodium shaders still need a runtime
+        // fallback because Metal can reject individual fragment functions.
+        boolean requestIndirectCommands = "sodium".equals(info.getLocation().getNamespace());
         if (this.firstAvailableVertexBufferSlot + this.vertexBufferCount
                 > MTL4ArgumentTable.MAX_BUFFERS) {
             throw new IllegalStateException("Pipeline " + info.getLocation()
@@ -119,7 +124,7 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
             if (compiler != null) {
                 MemorySegment vertexLibrary = device.getOrCompileLibrary(vertexMsl);
                 MemorySegment fragmentLibrary = device.getOrCompileLibrary(fragmentMsl);
-                this.withDepthPipeline = createMetal4Pipeline(
+                MemorySegment pipeline = createMetal4Pipeline(
                         device,
                         compiler,
                         info,
@@ -130,16 +135,63 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
                         vertexDescriptor,
                         colorFormat,
                         this.topology,
+                        requestIndirectCommands,
                         pipelineCacheKey
                 );
+                if (ObjC.isNil(pipeline) && requestIndirectCommands) {
+                    Metallum.LOGGER.warn("[metallum] Pipeline {} is not ICB-compatible; using direct draws",
+                            info.getLocation());
+                    requestIndirectCommands = false;
+                    pipeline = createMetal4Pipeline(
+                            device,
+                            compiler,
+                            info,
+                            vertexLibrary,
+                            vertexEntryPoint,
+                            fragmentLibrary,
+                            fragmentEntryPoint,
+                            vertexDescriptor,
+                            colorFormat,
+                            this.topology,
+                            false,
+                            pipelineCacheKey
+                    );
+                }
+                this.withDepthPipeline = pipeline;
                 this.withoutDepthPipeline = this.withDepthPipeline;
+                this.supportsIndirectCommands = requestIndirectCommands && !ObjC.isNil(pipeline);
             } else {
                 MemorySegment vertexFunction = device.getOrCompileFunction(vertexMsl, vertexEntryPoint);
                 MemorySegment fragmentFunction = device.getOrCompileFunction(fragmentMsl, fragmentEntryPoint);
-                this.withDepthPipeline = createPipeline(device, info, vertexFunction, fragmentFunction, vertexDescriptor, colorFormat, MTLPixelFormat.Depth32Float, pipelineCacheKey);
-                this.withoutDepthPipeline = depthStencilState == null
-                        ? createPipeline(device, info, vertexFunction, fragmentFunction, vertexDescriptor, colorFormat, MTLPixelFormat.Invalid, pipelineCacheKey)
-                        : MemorySegment.NULL;
+                MemorySegment withDepth = createPipeline(device, info, vertexFunction, fragmentFunction,
+                        vertexDescriptor, colorFormat, MTLPixelFormat.Depth32Float,
+                        requestIndirectCommands, pipelineCacheKey);
+                if (ObjC.isNil(withDepth) && requestIndirectCommands) {
+                    Metallum.LOGGER.warn("[metallum] Pipeline {} is not ICB-compatible; using direct draws",
+                            info.getLocation());
+                    requestIndirectCommands = false;
+                    withDepth = createPipeline(device, info, vertexFunction, fragmentFunction,
+                            vertexDescriptor, colorFormat, MTLPixelFormat.Depth32Float,
+                            false, pipelineCacheKey);
+                }
+
+                MemorySegment withoutDepth = MemorySegment.NULL;
+                if (depthStencilState == null) {
+                    withoutDepth = createPipeline(device, info, vertexFunction, fragmentFunction,
+                            vertexDescriptor, colorFormat, MTLPixelFormat.Invalid,
+                            requestIndirectCommands, pipelineCacheKey);
+                    if (ObjC.isNil(withoutDepth) && requestIndirectCommands) {
+                        requestIndirectCommands = false;
+                        withoutDepth = createPipeline(device, info, vertexFunction, fragmentFunction,
+                                vertexDescriptor, colorFormat, MTLPixelFormat.Invalid,
+                                false, pipelineCacheKey);
+                    }
+                }
+                this.withDepthPipeline = withDepth;
+                this.withoutDepthPipeline = withoutDepth;
+                this.supportsIndirectCommands = requestIndirectCommands
+                        && !ObjC.isNil(withDepth)
+                        && (depthStencilState != null || !ObjC.isNil(withoutDepth));
             }
         }
     }
@@ -155,6 +207,7 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
             final MTLVertexDescriptor vertexDescriptor,
             final MTLPixelFormat colorFormat,
             final MTLPrimitiveType topology,
+            final boolean supportsIndirectCommands,
             final String pipelineCacheKey
     ) {
         if (ObjC.isNil(vertexLibrary) || ObjC.isNil(fragmentLibrary)) {
@@ -176,7 +229,7 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
             descriptor.setVertexDescriptor(vertexDescriptor);
             descriptor.setColorAttachmentFormat(0, colorFormat.value);
             descriptor.setInputPrimitiveTopology(topologyClass(topology));
-            descriptor.setSupportIndirectCommandBuffers(true);
+            descriptor.setSupportIndirectCommandBuffers(supportsIndirectCommands);
 
             if (blendFunction.isPresent()) {
                 BlendFunction function = blendFunction.get();
@@ -212,6 +265,7 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
             final MTLVertexDescriptor vertexDescriptor,
             final MTLPixelFormat colorFormat,
             final MTLPixelFormat depthFormat,
+            final boolean supportsIndirectCommands,
             final String pipelineCacheKey
     ) {
         if (ObjC.isNil(vertexFunction) || ObjC.isNil(fragmentFunction)) {
@@ -228,7 +282,7 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
             pipelineDesc.setVertexDescriptor(vertexDescriptor);
             pipelineDesc.setColorAttachmentFormat(0, colorFormat);
             pipelineDesc.setDepthStencilFormats(depthFormat, MTLPixelFormat.Invalid);
-            pipelineDesc.setSupportIndirectCommandBuffers(true);
+            pipelineDesc.setSupportIndirectCommandBuffers(supportsIndirectCommands);
             MTLBinaryArchive archive = device.metal3Archive();
             if (archive != null) {
                 pipelineDesc.setBinaryArchive(archive.handle());
@@ -272,6 +326,10 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
 
     long allResourceMask() {
         return this.allResourceMask;
+    }
+
+    boolean supportsIndirectCommands() {
+        return this.supportsIndirectCommands;
     }
 
     @Nullable
