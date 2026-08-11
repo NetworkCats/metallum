@@ -19,16 +19,13 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
 import java.util.HexFormat;
+import java.util.Locale;
 import java.util.concurrent.ConcurrentSkipListSet;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
 
 /** Stable device/runtime identity and per-pipeline fingerprints for native archives. */
 final class PipelineCacheIdentity {
-    private static final MemorySegment PROCESS_INFO_CLASS = ObjC.findClass("NSProcessInfo");
-    private static final Msg PROCESS_INFO = Msg.of("processInfo", ADDRESS);
-    private static final Msg OS_VERSION_STRING = Msg.of("operatingSystemVersionString", ADDRESS);
-
     private final String globalKey;
     private final Path archivePath;
     private final Path manifestPath;
@@ -142,16 +139,38 @@ final class PipelineCacheIdentity {
     }
 
     private static String osBuild() {
-        if (ObjC.isNil(PROCESS_INFO_CLASS)) {
-            return System.getProperty("os.version", "unknown");
+        String fallback = System.getProperty("os.version", "unknown");
+        if (!System.getProperty("os.name", "")
+                .toLowerCase(Locale.ROOT)
+                .contains("mac")) {
+            return fallback;
         }
+
+        try {
+            if (ObjC.isNil(ProcessInfo.PROCESS_INFO_CLASS)) {
+                return fallback;
+            }
+        } catch (LinkageError | RuntimeException exception) {
+            return fallback;
+        }
+
         try (AutoreleasePool ignored = AutoreleasePool.push()) {
-            MemorySegment processInfo = PROCESS_INFO.sendPtr(PROCESS_INFO_CLASS);
-            MemorySegment version = OS_VERSION_STRING.sendPtr(processInfo);
+            MemorySegment processInfo = ProcessInfo.PROCESS_INFO.sendPtr(ProcessInfo.PROCESS_INFO_CLASS);
+            MemorySegment version = ProcessInfo.OS_VERSION_STRING.sendPtr(processInfo);
             String value = ObjC.isNil(version) ? "" : ObjC.javaString(version);
-            return value.isBlank() ? System.getProperty("os.version", "unknown") : value;
+            return value.isBlank() ? fallback : value;
         } catch (RuntimeException exception) {
-            return System.getProperty("os.version", "unknown");
+            return fallback;
+        }
+    }
+
+    /** Loads Foundation symbols only when the native OS identity is actually needed. */
+    private static final class ProcessInfo {
+        private static final MemorySegment PROCESS_INFO_CLASS = ObjC.findClass("NSProcessInfo");
+        private static final Msg PROCESS_INFO = Msg.of("processInfo", ADDRESS);
+        private static final Msg OS_VERSION_STRING = Msg.of("operatingSystemVersionString", ADDRESS);
+
+        private ProcessInfo() {
         }
     }
 
