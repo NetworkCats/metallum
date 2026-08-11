@@ -9,8 +9,8 @@ public enum MTLTextureUsage {
     ShaderRead(1L),
     ShaderWrite(2L),
     RenderTarget(4L),
-    PixelFormatView(8L),
-    ShaderAtomic(16L);
+    PixelFormatView(0x10L),
+    ShaderAtomic(0x20L);
 
     public final long value;
 

@@ -1,6 +1,5 @@
 package com.metallum.render;
 
-import com.metallum.mtl.MTLBuffer;
 import com.mojang.blaze3d.buffers.GpuBuffer;
 import com.mojang.blaze3d.buffers.GpuBuffer.Usage;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
@@ -10,7 +9,6 @@ import com.mojang.blaze3d.util.TransientBlockAllocator;
 import it.unimi.dsi.fastutil.objects.ReferenceArrayList;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
-import net.minecraft.util.Mth;
 import org.jspecify.annotations.NonNull;
 import org.lwjgl.system.MemoryUtil;
 
@@ -44,7 +42,9 @@ final class MetalTransientMemory implements TransientMemory {
         Stats.recordHighWater(Stats.Counter.TRANSIENT_HIGH_WATER_BYTES, this.frameAllocatedBytes);
         Stats.recordHighWater(
                 Stats.Counter.TRANSIENT_BLOCKS,
-                (this.frameAllocatedBytes + this.blockSize - 1L) / this.blockSize
+                this.frameAllocatedBytes == 0L
+                        ? 0L
+                        : 1L + (this.frameAllocatedBytes - 1L) / this.blockSize
         );
         long nextBlockSize = this.sizingPolicy.recordFrame(this.frameAllocatedBytes);
         this.frameAllocatedBytes = 0L;
@@ -65,7 +65,7 @@ final class MetalTransientMemory implements TransientMemory {
     }
 
     private MetalGpuBuffer allocateGpuBlock(final long size) {
-        return new MetalGpuBuffer(device, BLOCK_USAGE, size);
+        return (MetalGpuBuffer) device.createBuffer(null, BLOCK_USAGE, size);
     }
 
     private void freeGpuBlock(final MetalGpuBuffer block) {
@@ -103,9 +103,10 @@ final class MetalTransientMemory implements TransientMemory {
 
     @Override
     public @NonNull ByteBuffer allocateCpu(final long size, final long alignment, final long minimumAllocation, final long elementSize) {
+        validateAllocation(size, alignment, minimumAllocation, elementSize, MAX_CPU_ALIGNMENT, true);
         recordAllocation(size);
         TransientBlockAllocator.Allocation<Long> alloc = cpuBlockAllocator.allocate(size, alignment, minimumAllocation, elementSize);
-        return MemoryUtil.memByteBuffer(alloc.block() + alloc.offset(), (int) alloc.size());
+        return MemoryUtil.memByteBuffer(alloc.block() + alloc.offset(), Math.toIntExact(alloc.size()));
     }
 
     @Override
@@ -115,6 +116,7 @@ final class MetalTransientMemory implements TransientMemory {
 
     @Override
     public @NonNull GpuBufferSlice allocateGpu(final long size, final long alignment, @Usage final int usage, final long minimumAllocation, final long elementSize) {
+        validateAllocation(size, alignment, minimumAllocation, elementSize, MAX_GPU_ALIGNMENT, false);
         recordAllocation(size);
         TransientBlockAllocator.Allocation<MetalGpuBuffer> alloc = gpuBlockAllocator.allocate(size, alignment, minimumAllocation, elementSize);
         return new GpuBufferSlice(wrap(alloc.block(), usage), alloc.offset(), alloc.size());
@@ -126,6 +128,7 @@ final class MetalTransientMemory implements TransientMemory {
     }
 
     private MappedView allocateMapped(final long size, final long alignment, @Usage final int usage, final long minimumAllocation, final long elementSize) {
+        validateAllocation(size, alignment, minimumAllocation, elementSize, MAX_GPU_ALIGNMENT, false);
         recordAllocation(size);
         TransientBlockAllocator.Allocation<MetalGpuBuffer> alloc = gpuBlockAllocator.allocate(size, alignment, minimumAllocation, elementSize);
         GpuBufferSlice slice = new GpuBufferSlice(wrap(alloc.block(), usage), alloc.offset(), alloc.size());
@@ -135,7 +138,7 @@ final class MetalTransientMemory implements TransientMemory {
     }
 
     private MetalGpuBuffer wrap(final MetalGpuBuffer block, @Usage final int usage) {
-        return new TransientGpuBuffer(device, block.metalBuffer(), usage, block.size(), this, submitIndex);
+        return new TransientGpuBuffer(device, block, usage, block.size(), this, submitIndex);
     }
 
     @Override
@@ -151,22 +154,20 @@ final class MetalTransientMemory implements TransientMemory {
     private GpuBufferSlice upload(final List<ByteBuffer> data, final long alignment, @Usage final int usage, final long minimumAllocation, final long elementSize) {
         long totalSize = 0L;
         for (ByteBuffer buffer : data) {
-            totalSize += buffer.remaining();
-            totalSize = Mth.roundToward(totalSize, alignment);
+            totalSize = checkedRoundUp(
+                    Math.addExact(totalSize, buffer.remaining()), alignment);
         }
         Stats.add(Stats.Counter.UPLOAD_BYTES, totalSize);
 
         GpuBufferSlice result;
         try (MappedView mapped = allocateMapped(totalSize, alignment, usage, minimumAllocation, elementSize)) {
-            long mappedPtr = MemoryUtil.memAddress(mapped.data());
+            ByteBuffer destination = mapped.data().duplicate();
             long offset = 0L;
             for (ByteBuffer buffer : data) {
-                MemoryUtil.memCopy(MemoryUtil.memAddress(buffer), mappedPtr + offset, Math.min(mapped.slice().length() - offset, buffer.remaining()));
-                offset += buffer.remaining();
-                offset = Mth.roundToward(offset, alignment);
-                if (offset >= mapped.slice().length()) {
-                    break;
-                }
+                int length = buffer.remaining();
+                destination.position(Math.toIntExact(offset));
+                destination.put(buffer.duplicate());
+                offset = checkedRoundUp(Math.addExact(offset, length), alignment);
             }
             result = mapped.slice();
         }
@@ -192,25 +193,26 @@ final class MetalTransientMemory implements TransientMemory {
         long packedSize = 0L;
         long uploadedBytes = 0L;
         for (ByteBuffer buffer : data) {
-            packedSize = Mth.roundToward(packedSize, alignment);
+            packedSize = checkedRoundUp(packedSize, alignment);
             packedSize = Math.addExact(packedSize, buffer.remaining());
             uploadedBytes = Math.addExact(uploadedBytes, buffer.remaining());
         }
 
         try (MappedView packed = allocateGpuMapped(packedSize, alignment, usage)) {
             GpuBufferSlice allocation = packed.slice();
-            long destination = MemoryUtil.memAddress(packed.data());
+            ByteBuffer destination = packed.data().duplicate();
             long offset = 0L;
             for (ByteBuffer buffer : data) {
-                offset = Mth.roundToward(offset, alignment);
+                offset = checkedRoundUp(offset, alignment);
                 int length = buffer.remaining();
-                MemoryUtil.memCopy(MemoryUtil.memAddress(buffer), destination + offset, length);
+                destination.position(Math.toIntExact(offset));
+                destination.put(buffer.duplicate());
                 uploaded.add(new GpuBufferSlice(
                         allocation.buffer(),
                         allocation.offset() + offset,
                         length
                 ));
-                offset += length;
+                offset = Math.addExact(offset, length);
             }
         }
         Stats.add(Stats.Counter.UPLOAD_BYTES, uploadedBytes);
@@ -221,22 +223,85 @@ final class MetalTransientMemory implements TransientMemory {
         this.frameAllocatedBytes = Math.addExact(this.frameAllocatedBytes, Math.max(size, 0L));
     }
 
+    static long checkedRoundUp(final long value, final long alignment) {
+        if (value < 0L) {
+            throw new IllegalArgumentException("Transient allocation size must not be negative: " + value);
+        }
+        if (alignment <= 0L) {
+            throw new IllegalArgumentException("Transient allocation alignment must be positive: " + alignment);
+        }
+        long remainder = value % alignment;
+        if (remainder == 0L) {
+            return value;
+        }
+        try {
+            return Math.addExact(value, alignment - remainder);
+        } catch (ArithmeticException exception) {
+            throw new IllegalArgumentException("Transient allocation alignment overflows", exception);
+        }
+    }
+
+    static void validateAllocation(
+            final long size,
+            final long alignment,
+            final long minimumAllocation,
+            final long elementSize,
+            final long maximumAlignment,
+            final boolean cpuAllocation
+    ) {
+        if (size < 0L || minimumAllocation < 0L) {
+            throw new IllegalArgumentException("Transient allocation sizes must not be negative");
+        }
+        if (alignment <= 0L || alignment > maximumAlignment) {
+            throw new IllegalArgumentException(
+                    "Transient allocation alignment must be in 1.." + maximumAlignment + ": " + alignment);
+        }
+        if (elementSize <= 0L) {
+            throw new IllegalArgumentException("Transient allocation element size must be positive: " + elementSize);
+        }
+        if (cpuAllocation && (size > Integer.MAX_VALUE
+                || minimumAllocation > Integer.MAX_VALUE
+                || elementSize > Integer.MAX_VALUE)) {
+            throw new IllegalArgumentException(
+                    "CPU transient allocations cannot exceed " + Integer.MAX_VALUE + " bytes");
+        }
+    }
+
     private static final class TransientGpuBuffer extends MetalGpuBuffer {
         private final MetalTransientMemory owner;
+        private final MetalGpuBuffer physicalBlock;
         private final long bufferSubmitIndex;
         private boolean closed;
 
         TransientGpuBuffer(
                 final MetalDevice device,
-                final MTLBuffer handle,
+                final MetalGpuBuffer physicalBlock,
                 @Usage final int usage,
                 final long size,
                 final MetalTransientMemory owner,
                 final long submitIndex
         ) {
-            super(device, usage, size, handle);
+            super(device, usage, size, physicalBlock.metalBuffer());
             this.owner = owner;
+            this.physicalBlock = physicalBlock;
             this.bufferSubmitIndex = submitIndex;
+        }
+
+        @Override
+        ByteBuffer indexData(final long offset, final long length) {
+            if (this.isClosed()) {
+                throw new IllegalStateException("Transient index buffer is closed");
+            }
+            BufferCopySupport.requireRange(offset, length, this.size(), "Transient index buffer");
+            return this.physicalBlock.sliceStorage(offset, length);
+        }
+
+        @Override
+        ByteBuffer knownCpuData(final long offset, final long length) {
+            if (this.isClosed()) {
+                return null;
+            }
+            return this.physicalBlock.sliceStorage(offset, length);
         }
 
         @Override

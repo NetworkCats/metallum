@@ -121,13 +121,22 @@ public final class MTLBuiltinPipelines {
         residencySet = liveResidencySet;
         metal4Compiler = compiler;
         metal3Archive = binaryArchive;
-        presentPipeline = buildPipeline(PRESENT_MSL, "metallum_present_vs", "metallum_present_fs",
-                MTLPixelFormat.BGRA8Unorm.value, MTLPixelFormat.Invalid.value, MTLColorWriteMask.All.value);
-        presentLinearSampler = buildPresentSampler(MTLSamplerMinMagFilter.Linear);
-        presentNearestSampler = buildPresentSampler(MTLSamplerMinMagFilter.Nearest);
-        ensureClearPipeline(MTLPixelFormat.BGRA8Unorm.value, MTLPixelFormat.Depth32Float.value, true);
-        ensureClearPipeline(MTLPixelFormat.RGBA8Unorm.value, MTLPixelFormat.Depth32Float.value, true);
-        ensureClearPipeline(MTLPixelFormat.BGRA8Unorm.value, MTLPixelFormat.Invalid.value, true);
+        try {
+            presentPipeline = buildPipeline(PRESENT_MSL, "metallum_present_vs", "metallum_present_fs",
+                    MTLPixelFormat.BGRA8Unorm.value, MTLPixelFormat.Invalid.value, MTLColorWriteMask.All.value);
+            presentLinearSampler = buildPresentSampler(MTLSamplerMinMagFilter.Linear);
+            presentNearestSampler = buildPresentSampler(MTLSamplerMinMagFilter.Nearest);
+            ensureClearPipeline(MTLPixelFormat.BGRA8Unorm.value, MTLPixelFormat.Depth32Float.value, true);
+            ensureClearPipeline(MTLPixelFormat.RGBA8Unorm.value, MTLPixelFormat.Depth32Float.value, true);
+            ensureClearPipeline(MTLPixelFormat.BGRA8Unorm.value, MTLPixelFormat.Invalid.value, true);
+        } catch (Throwable throwable) {
+            try {
+                close();
+            } catch (Throwable cleanupFailure) {
+                throwable.addSuppressed(cleanupFailure);
+            }
+            throw throwable;
+        }
     }
 
     public static void close() {
@@ -256,43 +265,30 @@ public final class MTLBuiltinPipelines {
                 }
                 encoder = commandBuffer.makeRenderCommandEncoder(renderPass);
             }
-
-            if (beginEncoder != null) {
-                beginEncoder.accept(encoder);
-            }
-
-            if (globalFence != null) {
-                encoder.waitForFence(globalFence, MTLRenderStages.Fragment);
-            }
-
-            if (!fullRegion) {
-                MemorySegment pipeline = ensureClearPipeline(MTLTexture.pixelFormat(colorTexture), MTLTexture.pixelFormat(depthTexture), true);
-                MemorySegment depthState = ensureDepthStencilState(MTLCompareFunction.Always, true);
-                if (ObjC.isNil(pipeline) || ObjC.isNil(depthState)) {
-                    if (finishEncoder != null) {
-                        finishEncoder.accept(encoder);
-                    }
-                    encoder.endEncoding();
-                    return;
+            encodeExternalRenderPass(encoder, beginEncoder, finishEncoder, () -> {
+                if (globalFence != null) {
+                    encoder.waitForFence(globalFence, MTLRenderStages.Fragment);
                 }
-                encodeClearDraw(
-                        encoder, pipeline,
-                        textureWidth, textureHeight,
-                        clearColor,
-                        clampedX, clampedY, clampedMaxX - clampedX, clampedMaxY - clampedY,
-                        depthState, clearDepth
-                );
-            }
 
-            if (globalFence != null) {
-                encoder.updateFence(globalFence, MTLRenderStages.Fragment);
-            }
+                if (!fullRegion) {
+                    MemorySegment pipeline = ensureClearPipeline(MTLTexture.pixelFormat(colorTexture), MTLTexture.pixelFormat(depthTexture), true);
+                    MemorySegment depthState = ensureDepthStencilState(MTLCompareFunction.Always, true);
+                    if (ObjC.isNil(pipeline) || ObjC.isNil(depthState)) {
+                        return;
+                    }
+                    encodeClearDraw(
+                            encoder, pipeline,
+                            textureWidth, textureHeight,
+                            clearColor,
+                            clampedX, clampedY, clampedMaxX - clampedX, clampedMaxY - clampedY,
+                            depthState, clearDepth
+                    );
+                }
 
-            if (finishEncoder != null) {
-                finishEncoder.accept(encoder);
-            }
-
-            encoder.endEncoding();
+                if (globalFence != null) {
+                    encoder.updateFence(globalFence, MTLRenderStages.Fragment);
+                }
+            });
         }
     }
 
@@ -327,36 +323,79 @@ public final class MTLBuiltinPipelines {
                 encoder = commandBuffer.makeRenderCommandEncoder(renderPass);
             }
 
+            encodeExternalRenderPass(encoder, beginEncoder, finishEncoder, () -> {
+                if (globalFence != null) {
+                    encoder.waitForFence(globalFence, MTLRenderStages.Fragment);
+                }
+
+                long drawableWidth = MTLTexture.width(drawableTexture);
+                long drawableHeight = MTLTexture.height(drawableTexture);
+                encoder.setViewport(0.0, 0.0, drawableWidth, drawableHeight, 0.0, 1.0);
+                encoder.setRenderPipelineState(presentPipeline);
+                encoder.setFragmentTexture(sourceTexture, 0L);
+
+                boolean requiresScaling = MTLTexture.width(sourceTexture) != drawableWidth
+                        || MTLTexture.height(sourceTexture) != drawableHeight;
+                encoder.setFragmentSamplerState(requiresScaling ? presentLinearSampler : presentNearestSampler, 0L);
+
+                encoder.drawPrimitives(MTLPrimitiveType.Triangle, 0, 3, 1, 0);
+
+                if (globalFence != null) {
+                    encoder.updateFence(globalFence, MTLRenderStages.Fragment);
+                }
+            });
+            commandBuffer.presentDrawable(drawable);
+        }
+    }
+
+    private static void encodeExternalRenderPass(
+            final MTLRenderCommandEncoder encoder,
+            @Nullable final Consumer<MTLRenderCommandEncoder> beginEncoder,
+            @Nullable final Consumer<MTLRenderCommandEncoder> finishEncoder,
+            final Runnable encode
+    ) {
+        boolean began = false;
+        boolean finishAttempted = false;
+        boolean endAttempted = false;
+        Throwable failure = null;
+        try {
             if (beginEncoder != null) {
                 beginEncoder.accept(encoder);
+                began = true;
             }
-
-            if (globalFence != null) {
-                encoder.waitForFence(globalFence, MTLRenderStages.Fragment);
-            }
-
-            long drawableWidth = MTLTexture.width(drawableTexture);
-            long drawableHeight = MTLTexture.height(drawableTexture);
-            encoder.setViewport(0.0, 0.0, drawableWidth, drawableHeight, 0.0, 1.0);
-            encoder.setRenderPipelineState(presentPipeline);
-            encoder.setFragmentTexture(sourceTexture, 0L);
-
-            boolean requiresScaling = MTLTexture.width(sourceTexture) != drawableWidth
-                    || MTLTexture.height(sourceTexture) != drawableHeight;
-            encoder.setFragmentSamplerState(requiresScaling ? presentLinearSampler : presentNearestSampler, 0L);
-
-            encoder.drawPrimitives(MTLPrimitiveType.Triangle, 0, 3, 1, 0);
-
-            if (globalFence != null) {
-                encoder.updateFence(globalFence, MTLRenderStages.Fragment);
-            }
-
+            encode.run();
             if (finishEncoder != null) {
+                finishAttempted = true;
                 finishEncoder.accept(encoder);
             }
-
+            endAttempted = true;
             encoder.endEncoding();
-            commandBuffer.presentDrawable(drawable);
+        } catch (RuntimeException | Error throwable) {
+            failure = throwable;
+            throw throwable;
+        } finally {
+            if (began && !finishAttempted && finishEncoder != null) {
+                try {
+                    finishEncoder.accept(encoder);
+                } catch (RuntimeException | Error cleanupFailure) {
+                    if (failure != null) {
+                        failure.addSuppressed(cleanupFailure);
+                    } else {
+                        failure = cleanupFailure;
+                    }
+                }
+            }
+            if (!endAttempted) {
+                try {
+                    encoder.endEncoding();
+                } catch (RuntimeException | Error cleanupFailure) {
+                    if (failure != null) {
+                        failure.addSuppressed(cleanupFailure);
+                    } else {
+                        failure = cleanupFailure;
+                    }
+                }
+            }
         }
     }
 

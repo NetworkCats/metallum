@@ -58,17 +58,33 @@ final class MetalGpuTexture extends GpuTexture {
                 descriptor.arrayLength(depthOrLayers);
             }
             descriptor.mipmapLevelCount(Math.max(mipLevels, 1));
-            descriptor.usage(toMtlTextureUsage(usage));
+            descriptor.usage(toMtlTextureUsage(usage, mipLevels));
             descriptor.storageMode(MTLStorageMode.Private);
             descriptor.hazardTrackingMode(MTLHazardTrackingMode.Untracked);
-            this.nativeHandle = device.metalDevice().newTexture(descriptor);
+            MemorySegment created = device.metalDevice().newTexture(descriptor);
+            try {
+                device.trackAllocation(created);
+            } catch (RuntimeException exception) {
+                ObjC.release(created);
+                throw exception;
+            }
+            this.nativeHandle = created;
             Stats.increment(Stats.Counter.NATIVE_RESOURCES_CREATED);
-            device.trackAllocation(this.nativeHandle);
         }
-        if (label != null && !label.isEmpty()) {
-            MemorySegment nsLabel = ObjC.nsString(label);
-            SET_LABEL.send(this.nativeHandle, nsLabel);
-            ObjC.release(nsLabel);
+        try {
+            if (label != null && !label.isEmpty()) {
+                MemorySegment nsLabel = ObjC.nsString(label);
+                try {
+                    SET_LABEL.send(this.nativeHandle, nsLabel);
+                } finally {
+                    ObjC.release(nsLabel);
+                }
+            }
+        } catch (RuntimeException exception) {
+            MemorySegment failed = this.nativeHandle;
+            this.nativeHandle = null;
+            this.device.releaseAllocationNow(failed);
+            throw exception;
         }
     }
 
@@ -102,6 +118,10 @@ final class MetalGpuTexture extends GpuTexture {
         return this.nativeHandle;
     }
 
+    boolean belongsTo(final MetalDevice device) {
+        return this.device == device;
+    }
+
     void queueNativeRelease(final MemorySegment handle) {
         this.device.queueResourceRelease(handle);
     }
@@ -116,6 +136,7 @@ final class MetalGpuTexture extends GpuTexture {
             throw new IllegalStateException("Too many views removed from texture");
         }
         if (this.closed && this.views == 0 && this.nativeHandle != null) {
+            this.device.discardPendingClears(this);
             MemorySegment handle = this.nativeHandle;
             this.nativeHandle = null;
             this.device.queueAllocationRelease(handle);
@@ -144,13 +165,18 @@ final class MetalGpuTexture extends GpuTexture {
         return this.closed;
     }
 
-    private static long toMtlTextureUsage(@GpuTexture.Usage final int usage) {
+    private static long toMtlTextureUsage(@GpuTexture.Usage final int usage, final int mipLevels) {
         long result = 0L;
         if ((usage & GpuTexture.USAGE_TEXTURE_BINDING) != 0) {
             result |= MTLTextureUsage.ShaderRead.value;
         }
         if ((usage & GpuTexture.USAGE_RENDER_ATTACHMENT) != 0) {
             result |= MTLTextureUsage.RenderTarget.value;
+        }
+        // A partial mip view is created through newTextureViewWithPixelFormat:...;
+        // Metal requires the source texture to opt into pixel-format views.
+        if (mipLevels > 1) {
+            result |= MTLTextureUsage.PixelFormatView.value;
         }
         return result == 0L ? MTLTextureUsage.Unknown.value : result;
     }

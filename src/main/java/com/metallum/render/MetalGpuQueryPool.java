@@ -19,6 +19,7 @@ final class MetalGpuQueryPool implements GpuQueryPool {
     private final long[] written;
     private final long[] resolved;
     private MTLGpuCounterPool nativePool;
+    private boolean closed;
 
     MetalGpuQueryPool(final MetalDevice device, final int size) {
         if (size <= 0) {
@@ -26,13 +27,14 @@ final class MetalGpuQueryPool implements GpuQueryPool {
         }
         this.device = device;
         this.values = new long[size];
-        this.written = new long[(size + Long.SIZE - 1) / Long.SIZE];
+        this.written = new long[Math.toIntExact(((long) size + Long.SIZE - 1L) / Long.SIZE)];
         this.resolved = new long[this.written.length];
         this.nativePool = MTLGpuCounterPool.create(
                 device.metalDevice(), size, device.usesMetal4CommandPath());
     }
 
     void write(final MTLRenderCommandEncoder encoder, final int index) {
+        checkOpen();
         checkIndex(index);
         this.values[index] = 0L;
         clear(this.resolved, index);
@@ -46,6 +48,7 @@ final class MetalGpuQueryPool implements GpuQueryPool {
     }
 
     void write(final MTLBlitCommandEncoder encoder, final int index) {
+        checkOpen();
         checkIndex(index);
         this.values[index] = 0L;
         clear(this.resolved, index);
@@ -65,6 +68,7 @@ final class MetalGpuQueryPool implements GpuQueryPool {
 
     @Override
     public @NonNull OptionalLong getValue(final int index) {
+        checkOpen();
         checkIndex(index);
         resolveRange(index, 1);
         return isSet(this.resolved, index)
@@ -74,6 +78,7 @@ final class MetalGpuQueryPool implements GpuQueryPool {
 
     @Override
     public OptionalLong @NonNull [] getValues(final int index, final int count) {
+        checkOpen();
         if (index < 0 || count < 0 || index > this.values.length - count) {
             throw new IndexOutOfBoundsException("Invalid timestamp query range " + index + "+" + count);
         }
@@ -111,6 +116,10 @@ final class MetalGpuQueryPool implements GpuQueryPool {
 
     @Override
     public void close() {
+        if (this.closed) {
+            return;
+        }
+        this.closed = true;
         Arrays.fill(this.values, 0L);
         Arrays.fill(this.written, 0L);
         Arrays.fill(this.resolved, 0L);
@@ -118,6 +127,16 @@ final class MetalGpuQueryPool implements GpuQueryPool {
             MemorySegment handle = this.nativePool.detach();
             this.nativePool = null;
             this.device.queueResourceRelease(handle);
+        }
+    }
+
+    boolean belongsTo(final MetalDevice candidate) {
+        return this.device == candidate;
+    }
+
+    private void checkOpen() {
+        if (this.closed) {
+            throw new IllegalStateException("Timestamp query pool is closed");
         }
     }
 

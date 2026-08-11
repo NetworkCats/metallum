@@ -27,6 +27,8 @@ public final class MTLRenderPassDescriptor implements AutoCloseable {
     private static final Msg DEPTH_ATTACHMENT = Msg.of("depthAttachment", ADDRESS);
     private static final Msg STENCIL_ATTACHMENT = Msg.of("stencilAttachment", ADDRESS);
     private static final Msg SET_TEXTURE = Msg.ofVoid("setTexture:", ADDRESS);
+    private static final Msg SET_LEVEL = Msg.ofVoid("setLevel:", JAVA_LONG);
+    private static final Msg SET_SLICE = Msg.ofVoid("setSlice:", JAVA_LONG);
     private static final Msg SET_LOAD_ACTION = Msg.ofVoid("setLoadAction:", JAVA_LONG);
     private static final Msg SET_STORE_ACTION = Msg.ofVoid("setStoreAction:", JAVA_LONG);
     private static final Msg SET_CLEAR_COLOR = Msg.ofVoid("setClearColor:", JAVA_DOUBLE, JAVA_DOUBLE, JAVA_DOUBLE, JAVA_DOUBLE);
@@ -61,8 +63,33 @@ public final class MTLRenderPassDescriptor implements AutoCloseable {
             final long storeAction,
             @Nullable final Vector4fc clearColor
     ) {
+        colorAttachment(index, texture, 0L, loadAction, storeAction, clearColor);
+    }
+
+    public void colorAttachment(
+            final long index,
+            final MemorySegment texture,
+            final long level,
+            final long loadAction,
+            final long storeAction,
+            @Nullable final Vector4fc clearColor
+    ) {
+        colorAttachment(index, texture, level, 0L, loadAction, storeAction, clearColor);
+    }
+
+    public void colorAttachment(
+            final long index,
+            final MemorySegment texture,
+            final long level,
+            final long slice,
+            final long loadAction,
+            final long storeAction,
+            @Nullable final Vector4fc clearColor
+    ) {
         MemorySegment attachment = OBJECT_AT_INDEXED_SUBSCRIPT.sendPtr(COLOR_ATTACHMENTS.sendPtr(this.handle), index);
         SET_TEXTURE.send(attachment, ObjC.orNil(texture));
+        SET_LEVEL.send(attachment, level);
+        SET_SLICE.send(attachment, slice);
         SET_LOAD_ACTION.send(attachment, loadAction);
         SET_STORE_ACTION.send(attachment, storeAction);
         if (loadAction == LOAD_ACTION_CLEAR && clearColor != null) {
@@ -71,8 +98,18 @@ public final class MTLRenderPassDescriptor implements AutoCloseable {
     }
 
     public void depthAttachment(final MemorySegment texture, final long loadAction, final long storeAction, @Nullable final Double clearDepth) {
+        depthAttachment(texture, 0L, loadAction, storeAction, clearDepth);
+    }
+
+    public void depthAttachment(final MemorySegment texture, final long level, final long loadAction, final long storeAction, @Nullable final Double clearDepth) {
+        depthAttachment(texture, level, 0L, loadAction, storeAction, clearDepth);
+    }
+
+    public void depthAttachment(final MemorySegment texture, final long level, final long slice, final long loadAction, final long storeAction, @Nullable final Double clearDepth) {
         MemorySegment attachment = DEPTH_ATTACHMENT.sendPtr(this.handle);
         SET_TEXTURE.send(attachment, ObjC.orNil(texture));
+        SET_LEVEL.send(attachment, level);
+        SET_SLICE.send(attachment, slice);
         SET_LOAD_ACTION.send(attachment, loadAction);
         SET_STORE_ACTION.send(attachment, storeAction);
         if (loadAction == LOAD_ACTION_CLEAR && clearDepth != null) {
@@ -81,8 +118,18 @@ public final class MTLRenderPassDescriptor implements AutoCloseable {
     }
 
     public void stencilAttachment(final MemorySegment texture, final long loadAction, final long storeAction) {
+        stencilAttachment(texture, 0L, loadAction, storeAction);
+    }
+
+    public void stencilAttachment(final MemorySegment texture, final long level, final long loadAction, final long storeAction) {
+        stencilAttachment(texture, level, 0L, loadAction, storeAction);
+    }
+
+    public void stencilAttachment(final MemorySegment texture, final long level, final long slice, final long loadAction, final long storeAction) {
         MemorySegment attachment = STENCIL_ATTACHMENT.sendPtr(this.handle);
         SET_TEXTURE.send(attachment, ObjC.orNil(texture));
+        SET_LEVEL.send(attachment, level);
+        SET_SLICE.send(attachment, slice);
         SET_LOAD_ACTION.send(attachment, loadAction);
         SET_STORE_ACTION.send(attachment, storeAction);
     }

@@ -18,7 +18,7 @@ import static java.lang.foreign.ValueLayout.ADDRESS;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
 @Environment(EnvType.CLIENT)
-public final class MTLCommandQueue {
+public final class MTLCommandQueue implements AutoCloseable {
     private static final int MAX_SUBMITS_IN_FLIGHT = 3;
 
     private static final Msg COMMAND_BUFFER = Msg.of("commandBuffer", ADDRESS);
@@ -279,9 +279,14 @@ public final class MTLCommandQueue {
                 throw exception;
             }
             Metal4SubmissionSlot slot = new Metal4SubmissionSlot(allocator, options, table);
-            MemorySegment handler = ObjCBlock.withConsumer(slot::complete);
-            ADD_FEEDBACK_HANDLER.send(options, handler);
-            return slot;
+            try {
+                MemorySegment handler = ObjCBlock.withConsumer(slot::complete);
+                ADD_FEEDBACK_HANDLER.send(options, handler);
+                return slot;
+            } catch (RuntimeException exception) {
+                slot.close();
+                throw exception;
+            }
         }
 
         void prepare() {

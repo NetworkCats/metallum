@@ -85,6 +85,10 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         }
     }
 
+    boolean belongsTo(final MetalDevice device) {
+        return this.device == device;
+    }
+
     MTLCommandBuffer commandBuffer() {
         if (commandBuffer != null) {
             return commandBuffer;
@@ -164,14 +168,14 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         }
         currentSubmitIndex++;
 
-        if (!awaitSubmitCompletion(currentSubmitIndex - MAX_SUBMITS_IN_FLIGHT, 5000L)) {
-            throw new IllegalStateException("5s timeout reached when waiting for Metal submit completion");
-        }
-
         String commandError = null;
         if (toClose != null) {
             commandError = toClose.buffer.errorDescription();
             toClose.buffer.close();
+        }
+
+        if (!awaitSubmitCompletion(currentSubmitIndex - MAX_SUBMITS_IN_FLIGHT, 5000L)) {
+            throw new IllegalStateException("5s timeout reached when waiting for Metal submit completion");
         }
 
         transientMemory.rotate();
@@ -229,9 +233,9 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             textureAccess(
                     ((MetalGpuTexture) colorTextureView.texture()),
                     colorTextureView.baseMipLevel(),
-                    colorTextureView.mipLevels(),
+                    1,
                     0,
-                    colorTextureView.texture().getDepthOrLayers(),
+                    1,
                     ResourceAccessTracker.Access.WRITE,
                     STAGE_FRAGMENT
             );
@@ -239,9 +243,9 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
                 textureAccess(
                         ((MetalGpuTexture) depthTextureView.texture()),
                         depthTextureView.baseMipLevel(),
-                        depthTextureView.mipLevels(),
+                        1,
                         0,
-                        depthTextureView.texture().getDepthOrLayers(),
+                        1,
                         ResourceAccessTracker.Access.WRITE,
                         STAGE_FRAGMENT
                 );
@@ -256,7 +260,7 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
     public @NonNull RenderPassBackend createRenderPass(final RenderPassDescriptor descriptor) {
         RenderPassDescriptor.Attachment<Optional<Vector4fc>> colorAttachment = descriptor.colorAttachments().getFirst();
         GpuTextureView colorTexture = colorAttachment.textureView();
-        MetalGpuTexture colorTex = (MetalGpuTexture) colorTexture.texture();
+        MetalGpuTexture colorTex = requireTextureView(colorTexture, "Color attachment");
         Vector4fc colorClear = colorAttachment.clearValue().orElse(null);
         Vector4fc pendingColor = pendingColorClears.get(colorTex);
         if (pendingColor != null && colorClear == null) {
@@ -276,10 +280,10 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         Double depthClear = null;
         if (depthAttachment != null) {
             depthTexture = depthAttachment.textureView();
+            MetalGpuTexture metalDepth = requireTextureView(depthTexture, "Depth attachment");
             OptionalDouble attachmentClear = depthAttachment.clearValue();
             depthClear = attachmentClear.isPresent() ? attachmentClear.getAsDouble() : null;
 
-            MetalGpuTexture metalDepth = (MetalGpuTexture) depthTexture.texture();
             Double pendingDepth = pendingDepthClears.get(metalDepth);
             if (pendingDepth != null && depthClear == null) {
                 if (isFullTextureView(depthTexture)) {
@@ -321,23 +325,24 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
     }
 
     void presentTextureToDrawable(final CAMetalLayer layer, final GpuTextureView textureView) {
-        MetalGpuTexture source = (MetalGpuTexture) textureView.texture();
+        MetalGpuTexture source = requireTextureView(textureView, "Presented texture");
+        MetalGpuTextureView sourceView = (MetalGpuTextureView) textureView;
         flushPendingClear(source);
         submitRenderPass();
         endEncoder();
         MTLCommandBuffer commandBuffer = commandBuffer();
         commandBuffer.encodePresentTextureToDrawable(
                 layer,
-                source.nativeHandle(),
+                sourceView.nativeHandle(),
                 trackerEnabled() ? null : fence,
                 trackerEnabled() ? encoder -> beginExternalRenderEncoder(
                         encoder,
                         () -> textureAccess(
                                 source,
                                 textureView.baseMipLevel(),
-                                textureView.mipLevels(),
+                                1,
                                 0,
-                                source.getDepthOrLayers(),
+                                1,
                                 ResourceAccessTracker.Access.READ,
                                 STAGE_FRAGMENT)) : null,
                 trackerEnabled() ? this::finishExternalRenderEncoder : null
@@ -346,13 +351,13 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
 
     @Override
     public void clearColorTexture(final @NonNull GpuTexture colorTexture, final @NonNull Vector4fc clearColor) {
-        pendingColorClears.put((MetalGpuTexture) colorTexture, new Vector4f(clearColor));
+        pendingColorClears.put(requireTexture(colorTexture, "Color clear texture"), new Vector4f(clearColor));
     }
 
     @Override
     public void clearColorAndDepthTextures(final @NonNull GpuTexture colorTexture, final @NonNull Vector4fc clearColor, final @NonNull GpuTexture depthTexture, final double clearDepth) {
-        MetalGpuTexture color = (MetalGpuTexture) colorTexture;
-        MetalGpuTexture depth = (MetalGpuTexture) depthTexture;
+        MetalGpuTexture color = requireTexture(colorTexture, "Color clear texture");
+        MetalGpuTexture depth = requireTexture(depthTexture, "Depth clear texture");
         pendingColorClears.put(color, new Vector4f(clearColor));
         pendingDepthClears.put(depth, clearDepth);
     }
@@ -368,9 +373,16 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             final int regionWidth,
             final int regionHeight
     ) {
-        MetalGpuTexture color = (MetalGpuTexture) colorTexture;
-        MetalGpuTexture depth = (MetalGpuTexture) depthTexture;
+        MetalGpuTexture color = requireTexture(colorTexture, "Color clear texture");
+        MetalGpuTexture depth = requireTexture(depthTexture, "Depth clear texture");
         Vector4fc clearColorCopy = new Vector4f(clearColor);
+        BufferCopySupport.requireRange(regionX, regionWidth, color.getWidth(0), "Color clear X region");
+        BufferCopySupport.requireRange(regionY, regionHeight, color.getHeight(0), "Color clear Y region");
+        BufferCopySupport.requireRange(regionX, regionWidth, depth.getWidth(0), "Depth clear X region");
+        BufferCopySupport.requireRange(regionY, regionHeight, depth.getHeight(0), "Depth clear Y region");
+        if (regionWidth == 0 || regionHeight == 0) {
+            return;
+        }
         if (isFullTextureRegion(color, depth, regionX, regionY, regionWidth, regionHeight)) {
             pendingColorClears.put(color, clearColorCopy);
             pendingDepthClears.put(depth, clearDepth);
@@ -394,10 +406,10 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
                         encoder,
                         () -> {
                             textureAccess(
-                                    color, 0, color.getMipLevels(), 0, color.getDepthOrLayers(),
+                                    color, 0, 1, 0, 1,
                                     ResourceAccessTracker.Access.WRITE, STAGE_FRAGMENT);
                             textureAccess(
-                                    depth, 0, depth.getMipLevels(), 0, depth.getDepthOrLayers(),
+                                    depth, 0, 1, 0, 1,
                                     ResourceAccessTracker.Access.WRITE, STAGE_FRAGMENT);
                         }) : null,
                 trackerEnabled() ? this::finishExternalRenderEncoder : null
@@ -406,13 +418,20 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
 
     @Override
     public void clearDepthTexture(final @NonNull GpuTexture depthTexture, final double clearDepth) {
-        pendingDepthClears.put((MetalGpuTexture) depthTexture, clearDepth);
+        pendingDepthClears.put(requireTexture(depthTexture, "Depth clear texture"), clearDepth);
     }
 
     @Override
     public void writeToBuffer(final GpuBufferSlice destination, final ByteBuffer data) {
-        MetalGpuBuffer buffer = (MetalGpuBuffer) destination.buffer();
+        MetalGpuBuffer buffer = requireBuffer(destination.buffer(), "Buffer write destination");
         int length = data.remaining();
+        BufferCopySupport.requireRange(
+                destination.offset(), destination.length(), buffer.size(), "Buffer write destination slice");
+        BufferCopySupport.requireRange(0L, length, destination.length(), "Buffer write");
+        if (length == 0) {
+            return;
+        }
+        buffer.mirrorWrite(destination.offset(), data);
 
         if (buffer.isDynamic()) {
             queueDynamicWrite(buffer, destination.offset(), data);
@@ -486,7 +505,12 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             return bucket.pop();
         }
         MTLBuffer buffer = device.metalDevice().newBuffer(size, resourceOptions);
-        device.trackAllocation(buffer.handle());
+        try {
+            device.trackAllocation(buffer.handle());
+        } catch (RuntimeException exception) {
+            ObjC.release(buffer.handle());
+            throw exception;
+        }
         return buffer;
     }
 
@@ -500,8 +524,18 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
 
     @Override
     public void copyToBuffer(final GpuBufferSlice source, final GpuBufferSlice target) {
-        MetalGpuBuffer sourceBuffer = (MetalGpuBuffer) source.buffer();
-        MetalGpuBuffer targetBuffer = (MetalGpuBuffer) target.buffer();
+        MetalGpuBuffer sourceBuffer = requireBuffer(source.buffer(), "Buffer copy source");
+        MetalGpuBuffer targetBuffer = requireBuffer(target.buffer(), "Buffer copy destination");
+        BufferCopySupport.requireRange(
+                source.offset(), source.length(), source.buffer().size(), "Buffer copy source slice");
+        BufferCopySupport.requireRange(
+                target.offset(), target.length(), target.buffer().size(), "Buffer copy destination slice");
+        BufferCopySupport.requireRange(0L, source.length(), target.length(), "Buffer copy destination");
+        if (source.length() == 0L) {
+            return;
+        }
+        targetBuffer.mirrorCopyFrom(
+                sourceBuffer, source.offset(), target.offset(), source.length());
         markGpuUse(sourceBuffer);
         markGpuUse(targetBuffer);
         MTLBlitCommandEncoder blit = blitCommandEncoder();
@@ -529,25 +563,31 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             final int width,
             final int height
     ) {
-        MetalGpuTexture metalDst = (MetalGpuTexture) destination;
-        flushPendingClearForWrite(metalDst);
-
+        MetalGpuTexture metalDst = requireTexture(destination, "Texture upload destination");
         int pixelSize = metalDst.pixelSize();
-        int rowBytes = width * pixelSize;
-        int bytesPerImage = rowBytes * height;
-        GpuBufferSlice slice = transientMemory.uploadStaging(source.duplicate().limit(bytesPerImage), pixelSize, GpuBuffer.USAGE_COPY_SRC);
+        BufferCopySupport.requireRange(mipLevel, 1L, metalDst.getMipLevels(), "Texture upload mip level");
+        BufferCopySupport.requireRange(depthOrLayer, 1L, metalDst.getDepthOrLayers(), "Texture upload layer");
+        BufferCopySupport.requireRange(destX, width, metalDst.getWidth(mipLevel), "Texture upload X region");
+        BufferCopySupport.requireRange(destY, height, metalDst.getHeight(mipLevel), "Texture upload Y region");
+        BufferCopySupport.ImageLayout layout = BufferCopySupport.imageLayout(width, height, pixelSize);
+        if (layout.imageBytes() == 0L) {
+            return;
+        }
+        ByteBuffer upload = BufferCopySupport.exactSlice(source, layout.imageBytes(), "Texture upload");
+        flushPendingClearForWrite(metalDst);
+        GpuBufferSlice slice = transientMemory.uploadStaging(upload, pixelSize, GpuBuffer.USAGE_COPY_SRC);
 
         MTLBlitCommandEncoder blit = blitCommandEncoder();
         MetalGpuBuffer uploadBuffer = (MetalGpuBuffer) slice.buffer();
-        bufferAccess(uploadBuffer.metalBuffer(), slice.offset(), bytesPerImage,
+        bufferAccess(uploadBuffer.metalBuffer(), slice.offset(), layout.imageBytes(),
                 ResourceAccessTracker.Access.READ, STAGE_BLIT);
         textureAccess(metalDst, mipLevel, 1, depthOrLayer, 1,
                 ResourceAccessTracker.Access.WRITE, STAGE_BLIT);
         blit.copyFromBufferToTexture(
                 uploadBuffer.metalBuffer(),
                 slice.offset(),
-                rowBytes,
-                bytesPerImage,
+                layout.rowBytes(),
+                layout.imageBytes(),
                 width,
                 height,
                 metalDst.nativeHandle(),
@@ -573,18 +613,39 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             final int mipLevel,
             final int arrayLayer
     ) {
-        MetalGpuTexture metalDst = (MetalGpuTexture) destination;
+        MetalGpuTexture metalDst = requireTexture(destination, "Buffer-to-texture destination");
+        MetalGpuBuffer sourceBuffer = requireBuffer(source.buffer(), "Buffer-to-texture source");
+        int texelSize = destination.getFormat().blockSize();
+        BufferCopySupport.requireRange(sourceX, copyWidth, sourceWidth, "Buffer-to-texture source X region");
+        BufferCopySupport.requireRange(sourceY, copyHeight, sourceHeight, "Buffer-to-texture source Y region");
+        BufferCopySupport.requireRange(mipLevel, 1L, metalDst.getMipLevels(), "Buffer-to-texture mip level");
+        BufferCopySupport.requireRange(arrayLayer, 1L, metalDst.getDepthOrLayers(), "Buffer-to-texture layer");
+        BufferCopySupport.requireRange(destinationX, copyWidth, metalDst.getWidth(mipLevel), "Buffer-to-texture destination X region");
+        BufferCopySupport.requireRange(destinationY, copyHeight, metalDst.getHeight(mipLevel), "Buffer-to-texture destination Y region");
+        BufferCopySupport.ImageLayout sourceLayout = BufferCopySupport.imageLayout(sourceWidth, sourceHeight, texelSize);
+        if (copyWidth == 0 || copyHeight == 0) {
+            return;
+        }
+        long skipBytes;
+        long sourceLength;
+        try {
+            skipBytes = Math.addExact(
+                    Math.multiplyExact((long) sourceY, sourceLayout.rowBytes()),
+                    Math.multiplyExact((long) sourceX, texelSize));
+            sourceLength = Math.addExact(
+                    Math.multiplyExact((long) copyHeight - 1L, sourceLayout.rowBytes()),
+                    Math.multiplyExact((long) copyWidth, texelSize));
+        } catch (ArithmeticException exception) {
+            throw new IllegalArgumentException("Buffer-to-texture copy byte range overflows", exception);
+        }
+        BufferCopySupport.requireRange(skipBytes, sourceLength, source.length(), "Buffer-to-texture source");
+        BufferCopySupport.requireRange(
+                source.offset(), source.length(), source.buffer().size(), "Buffer-to-texture source slice");
         flushPendingClearForWrite(metalDst);
 
-        int texelSize = destination.getFormat().blockSize();
-        long skipBytes = (sourceX + (long) sourceY * sourceWidth) * texelSize;
-        long rowBytes = (long) sourceWidth * texelSize;
-
         MTLBlitCommandEncoder blit = blitCommandEncoder();
-        MetalGpuBuffer sourceBuffer = (MetalGpuBuffer) source.buffer();
         markGpuUse(sourceBuffer);
         long sourceOffset = source.offset() + skipBytes;
-        long sourceLength = Math.min(source.length() - skipBytes, rowBytes * sourceHeight);
         bufferAccess(sourceBuffer.metalBuffer(), sourceOffset, sourceLength,
                 ResourceAccessTracker.Access.READ, STAGE_BLIT);
         textureAccess(metalDst, mipLevel, 1, arrayLayer, 1,
@@ -592,8 +653,8 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         blit.copyFromBufferToTexture(
                 sourceBuffer.metalBuffer(),
                 sourceOffset,
-                rowBytes,
-                rowBytes * sourceHeight,
+                sourceLayout.rowBytes(),
+                sourceLayout.imageBytes(),
                 copyWidth,
                 copyHeight,
                 metalDst.nativeHandle(),
@@ -621,18 +682,26 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             final int width,
             final int height
     ) {
-        MetalGpuTexture texture = (MetalGpuTexture) source;
-        flushPendingClear(texture);
-        MetalGpuBuffer buffer = (MetalGpuBuffer) destination;
-        markGpuUse(buffer);
+        MetalGpuTexture texture = requireTexture(source, "Texture readback source");
+        MetalGpuBuffer buffer = requireBuffer(destination, "Texture readback destination");
         int bytesPerPixel = texture.pixelSize();
-        int rowBytes = width * bytesPerPixel;
-        int bytesPerImage = rowBytes * height;
+        BufferCopySupport.requireRange(mipLevel, 1L, texture.getMipLevels(), "Texture readback mip level");
+        BufferCopySupport.requireRange(x, width, texture.getWidth(mipLevel), "Texture readback X region");
+        BufferCopySupport.requireRange(y, height, texture.getHeight(mipLevel), "Texture readback Y region");
+        BufferCopySupport.ImageLayout layout = BufferCopySupport.imageLayout(width, height, bytesPerPixel);
+        BufferCopySupport.requireRange(offset, layout.imageBytes(), buffer.size(), "Texture readback destination");
+        if (layout.imageBytes() == 0L) {
+            queueForDestroy(callback);
+            return;
+        }
+        buffer.invalidateMirror(offset, layout.imageBytes());
+        flushPendingClear(texture);
+        markGpuUse(buffer);
 
         MTLBlitCommandEncoder blit = blitCommandEncoder();
         textureAccess(texture, mipLevel, 1, 0, 1,
                 ResourceAccessTracker.Access.READ, STAGE_BLIT);
-        bufferAccess(buffer.metalBuffer(), offset, bytesPerImage,
+        bufferAccess(buffer.metalBuffer(), offset, layout.imageBytes(),
                 ResourceAccessTracker.Access.WRITE, STAGE_BLIT);
         blit.copyFromTextureToBuffer(
                 texture.nativeHandle(),
@@ -644,8 +713,8 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
                 height,
                 buffer.metalBuffer(),
                 offset,
-                rowBytes,
-                bytesPerImage
+                layout.rowBytes(),
+                layout.imageBytes()
         );
         queueForDestroy(callback);
     }
@@ -662,8 +731,22 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             final int width,
             final int height
     ) {
-        MetalGpuTexture srcTexture = (MetalGpuTexture) source;
-        MetalGpuTexture dstTexture = (MetalGpuTexture) destination;
+        MetalGpuTexture srcTexture = requireTexture(source, "Texture copy source");
+        MetalGpuTexture dstTexture = requireTexture(destination, "Texture copy destination");
+        if (srcTexture.getFormat() != dstTexture.getFormat()) {
+            throw new IllegalArgumentException(
+                    "Metal texture copies require matching formats: "
+                            + srcTexture.getFormat() + " and " + dstTexture.getFormat());
+        }
+        BufferCopySupport.requireRange(mipLevel, 1L, srcTexture.getMipLevels(), "Texture copy source mip level");
+        BufferCopySupport.requireRange(mipLevel, 1L, dstTexture.getMipLevels(), "Texture copy destination mip level");
+        BufferCopySupport.requireRange(sourceX, width, srcTexture.getWidth(mipLevel), "Texture copy source X region");
+        BufferCopySupport.requireRange(sourceY, height, srcTexture.getHeight(mipLevel), "Texture copy source Y region");
+        BufferCopySupport.requireRange(destX, width, dstTexture.getWidth(mipLevel), "Texture copy destination X region");
+        BufferCopySupport.requireRange(destY, height, dstTexture.getHeight(mipLevel), "Texture copy destination Y region");
+        if (width == 0 || height == 0) {
+            return;
+        }
         flushPendingClear(srcTexture);
         flushPendingClearForWrite(dstTexture);
         MTLBlitCommandEncoder blit = blitCommandEncoder();
@@ -818,17 +901,33 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         Stats.increment(Stats.Counter.ENCODER_SWITCHES);
         beginTrackedEncoder(encoder);
         this.currentEncoder = encoder;
-        declareAccesses.run();
+        try {
+            declareAccesses.run();
+        } catch (RuntimeException | Error failure) {
+            try {
+                finishTrackedRenderEncoder(encoder);
+            } catch (RuntimeException | Error cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            } finally {
+                this.currentEncoder = null;
+                this.activeEncoderId = -1L;
+                this.activeDependencyFence = null;
+            }
+            throw failure;
+        }
     }
 
     private void finishExternalRenderEncoder(final MTLRenderCommandEncoder encoder) {
         if (this.currentEncoder != encoder) {
             throw new IllegalStateException("Unexpected external Metal encoder completion");
         }
-        finishTrackedRenderEncoder(encoder);
-        this.currentEncoder = null;
-        this.activeEncoderId = -1L;
-        this.activeDependencyFence = null;
+        try {
+            finishTrackedRenderEncoder(encoder);
+        } finally {
+            this.currentEncoder = null;
+            this.activeEncoderId = -1L;
+            this.activeDependencyFence = null;
+        }
     }
 
     private void finishTrackedRenderEncoder(final MTLRenderCommandEncoder encoder) {
@@ -939,6 +1038,7 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
                 semaphore.release();
                 return true;
             } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
                 throw new IllegalStateException("Render thread interrupted while waiting for Metal submit completion", e);
             }
         }
@@ -975,6 +1075,8 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         }
         dynamicBackingPool.clear();
         pendingDynamicBuffers.clear();
+        pendingColorClears.clear();
+        pendingDepthClears.clear();
     }
 
     void waitForSubmittedGpuWork() {
@@ -983,20 +1085,29 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         } else {
             endEncoder();
         }
-        long latestSubmit = currentSubmitIndex - 1L;
-        if (latestSubmit >= MAX_SUBMITS_IN_FLIGHT) {
+        long latestSubmit = -1L;
+        for (InFlight submission : this.inFlight) {
+            if (submission != null) {
+                latestSubmit = Math.max(latestSubmit, submission.index);
+            }
+        }
+        if (latestSubmit >= 0L) {
             awaitSubmitCompletion(latestSubmit, Long.MAX_VALUE);
         }
     }
 
     @Override
     public void writeTimestamp(final @NonNull GpuQueryPool pool, final int index) {
-        if (pool instanceof MetalGpuQueryPool metalPool && index >= 0 && index < pool.size()) {
-            if (currentEncoder instanceof MTLRenderCommandEncoder renderEncoder) {
-                metalPool.write(renderEncoder, index);
-            } else {
-                metalPool.write(blitCommandEncoder(), index);
-            }
+        if (!(pool instanceof MetalGpuQueryPool metalPool)) {
+            throw new IllegalArgumentException("Metal command encoder cannot use a foreign timestamp query pool");
+        }
+        if (!metalPool.belongsTo(this.device)) {
+            throw new IllegalArgumentException("Timestamp query pool belongs to another Metal device");
+        }
+        if (currentEncoder instanceof MTLRenderCommandEncoder renderEncoder) {
+            metalPool.write(renderEncoder, index);
+        } else {
+            metalPool.write(blitCommandEncoder(), index);
         }
     }
 
@@ -1017,37 +1128,95 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         }
 
         endEncoder();
-        MTLRenderCommandEncoder encoder = commandBuffer().makeRenderCommandEncoder(
-                colorClear != null ? texture.nativeHandle() : MemorySegment.NULL,
-                colorClear,
-                depthClear != null ? texture.nativeHandle() : MemorySegment.NULL,
-                depthClear,
-                1.0, 1.0
-        );
-        Stats.increment(Stats.Counter.ENCODER_SWITCHES);
-        beginTrackedEncoder(encoder);
-        currentEncoder = encoder;
-        if (!trackerEnabled()) {
-            encoder.waitForFence(fence, MTLRenderStages.VertexAndFragment);
-            Stats.increment(Stats.Counter.FENCE_WAITS);
-        } else {
-            textureAccess(
-                    texture,
-                    0,
-                    texture.getMipLevels(),
-                    0,
-                    texture.getDepthOrLayers(),
-                    ResourceAccessTracker.Access.WRITE,
-                    STAGE_FRAGMENT
-            );
+        int layers = texture.getDepthOrLayers();
+        for (int mipLevel = 0; mipLevel < texture.getMipLevels(); mipLevel++) {
+            for (int layer = 0; layer < layers; layer++) {
+                MTLRenderCommandEncoder encoder = commandBuffer().makeRenderCommandEncoder(
+                        colorClear != null ? texture.nativeHandle() : MemorySegment.NULL,
+                        mipLevel,
+                        layer,
+                        colorClear,
+                        depthClear != null ? texture.nativeHandle() : MemorySegment.NULL,
+                        mipLevel,
+                        layer,
+                        depthClear,
+                        texture.getWidth(mipLevel),
+                        texture.getHeight(mipLevel)
+                );
+                Stats.increment(Stats.Counter.ENCODER_SWITCHES);
+                beginTrackedEncoder(encoder);
+                currentEncoder = encoder;
+                if (!trackerEnabled()) {
+                    encoder.waitForFence(fence, MTLRenderStages.VertexAndFragment);
+                    Stats.increment(Stats.Counter.FENCE_WAITS);
+                } else {
+                    textureAccess(
+                            texture,
+                            mipLevel,
+                            1,
+                            layer,
+                            1,
+                            ResourceAccessTracker.Access.WRITE,
+                            STAGE_FRAGMENT
+                    );
+                }
+                if (mipLevel + 1 < texture.getMipLevels() || layer + 1 < layers) {
+                    endEncoder();
+                }
+            }
         }
         texture.recordMaterializedClear(colorClear, depthClear);
     }
 
+    void discardPendingClears(final MetalGpuTexture texture) {
+        this.pendingColorClears.remove(texture);
+        this.pendingDepthClears.remove(texture);
+    }
+
     private static boolean isFullTextureView(final GpuTextureView textureView) {
         return textureView.baseMipLevel() == 0
-                && textureView.mipLevels() >= textureView.texture().getMipLevels()
+                && textureView.texture().getMipLevels() == 1
+                && textureView.mipLevels() >= 1
                 && textureView.texture().getDepthOrLayers() == 1;
+    }
+
+    private MetalGpuBuffer requireBuffer(final GpuBuffer buffer, final String operation) {
+        if (!(buffer instanceof MetalGpuBuffer metalBuffer)) {
+            throw new IllegalArgumentException(operation + " does not belong to the Metal backend");
+        }
+        if (!metalBuffer.belongsTo(this.device)) {
+            throw new IllegalArgumentException(operation + " belongs to another Metal device");
+        }
+        if (metalBuffer.isClosed()) {
+            throw new IllegalStateException(operation + " buffer is closed");
+        }
+        return metalBuffer;
+    }
+
+    private MetalGpuTexture requireTexture(final GpuTexture texture, final String operation) {
+        if (!(texture instanceof MetalGpuTexture metalTexture)) {
+            throw new IllegalArgumentException(operation + " does not belong to the Metal backend");
+        }
+        if (!metalTexture.belongsTo(this.device)) {
+            throw new IllegalArgumentException(operation + " belongs to another Metal device");
+        }
+        if (metalTexture.isClosed()) {
+            throw new IllegalStateException(operation + " texture is closed");
+        }
+        return metalTexture;
+    }
+
+    private MetalGpuTexture requireTextureView(final GpuTextureView view, final String operation) {
+        if (!(view instanceof MetalGpuTextureView)) {
+            throw new IllegalArgumentException(operation + " view does not belong to the Metal backend");
+        }
+        if (view.isClosed()) {
+            throw new IllegalStateException(operation + " view is closed");
+        }
+        if (!(view.texture() instanceof MetalGpuTexture texture) || !texture.belongsTo(this.device)) {
+            throw new IllegalArgumentException(operation + " belongs to another Metal device");
+        }
+        return texture;
     }
 
     private static boolean isFullTextureRegion(

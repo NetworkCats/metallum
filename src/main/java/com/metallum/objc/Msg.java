@@ -270,6 +270,14 @@ public record Msg(String name, MemorySegment sel, MethodHandle handle) {
         }
     }
 
+    public boolean sendBoolean(MemorySegment self) {
+        try {
+            return (boolean) handle.invokeExact(self, sel);
+        } catch (Throwable throwable) {
+            throw fail(throwable);
+        }
+    }
+
     public boolean sendBoolean(MemorySegment self, MemorySegment a, MemorySegment b) {
         try {
             return (boolean) handle.invokeExact(self, sel, a, b);

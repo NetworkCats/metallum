@@ -50,11 +50,11 @@ public final class MTLTexture {
     }
 
     public static MemorySegment newTextureView(final MemorySegment texture, final long baseMipLevel, final long mipLevelCount) {
-        if (mipLevelCount <= 0) {
+        if (baseMipLevel < 0L || mipLevelCount <= 0L) {
             return MemorySegment.NULL;
         }
         long totalMipLevels = MIPMAP_LEVEL_COUNT.sendLong(texture);
-        if (baseMipLevel >= totalMipLevels || baseMipLevel + mipLevelCount > totalMipLevels) {
+        if (baseMipLevel >= totalMipLevels || mipLevelCount > totalMipLevels - baseMipLevel) {
             return MemorySegment.NULL;
         }
         return NEW_TEXTURE_VIEW.sendPtr(
@@ -88,12 +88,15 @@ public final class MTLTexture {
                 return MemorySegment.NULL;
             }
             long alignedBytesPerRow = roundUp(bytesPerRow, alignment);
-            if (alignedBytesPerRow > bufferLength - offset) {
+            if (alignedBytesPerRow < 0L || alignedBytesPerRow > bufferLength - offset) {
                 return MemorySegment.NULL;
             }
 
             MemorySegment descriptor = TEXTURE_BUFFER_DESCRIPTOR.sendPtr(
                     TEXTURE_DESCRIPTOR_CLS, pixelFormat, width, 0L, MTLTextureUsage.ShaderRead.value);
+            if (ObjC.isNil(descriptor)) {
+                return MemorySegment.NULL;
+            }
             SET_STORAGE_MODE.send(descriptor, STORAGE_MODE.sendLong(buffer));
             SET_HAZARD_TRACKING_MODE.send(descriptor, MTLHazardTrackingMode.Untracked.value);
 
@@ -117,6 +120,10 @@ public final class MTLTexture {
 
     private static long roundUp(final long value, final long alignment) {
         long remainder = value % alignment;
-        return remainder == 0 ? value : value + alignment - remainder;
+        if (remainder == 0L) {
+            return value;
+        }
+        long padding = alignment - remainder;
+        return value > Long.MAX_VALUE - padding ? -1L : value + padding;
     }
 }

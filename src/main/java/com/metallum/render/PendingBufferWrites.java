@@ -32,11 +32,11 @@ final class PendingBufferWrites {
         long start = offset;
         long end = offset + length;
         Map.Entry<Long, byte[]> floor = this.ranges.floorEntry(start);
-        if (floor != null && floor.getKey() + floor.getValue().length >= start) {
+        if (floor != null && floor.getKey() + floor.getValue().length > start) {
             start = floor.getKey();
         }
         Map.Entry<Long, byte[]> next = this.ranges.ceilingEntry(start);
-        while (next != null && next.getKey() <= end) {
+        while (next != null && next.getKey() < end) {
             end = Math.max(end, next.getKey() + next.getValue().length);
             next = this.ranges.higherEntry(next.getKey());
         }
@@ -57,11 +57,14 @@ final class PendingBufferWrites {
     }
 
     boolean coversWholeBuffer(final long size) {
-        Map.Entry<Long, byte[]> first = this.ranges.firstEntry();
-        return this.ranges.size() == 1
-                && first != null
-                && first.getKey() == 0L
-                && first.getValue().length == size;
+        long covered = 0L;
+        for (Map.Entry<Long, byte[]> range : this.ranges.entrySet()) {
+            if (range.getKey() != covered) {
+                return false;
+            }
+            covered += range.getValue().length;
+        }
+        return covered == size;
     }
 
     void applyTo(final ByteBuffer destination) {

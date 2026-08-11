@@ -46,6 +46,9 @@ public record MTLDevice(MemorySegment handle) {
             Msg.ofVoid("setShouldMaximizeConcurrentCompilation:", java.lang.foreign.ValueLayout.JAVA_BOOLEAN);
     private static final Msg MAXIMUM_CONCURRENT_COMPILATION_TASK_COUNT =
             Msg.of("maximumConcurrentCompilationTaskCount", JAVA_LONG);
+    private static final Msg DEPTH24_STENCIL8_SUPPORTED = Msg.of(
+            "isDepth24Stencil8PixelFormatSupported",
+            java.lang.foreign.ValueLayout.JAVA_BOOLEAN);
 
     private static final String METAL_4_QUEUE_SELECTOR = "newMTL4CommandQueue";
     private static final String CONCURRENT_COMPILATION_SELECTOR = "setShouldMaximizeConcurrentCompilation:";
@@ -103,6 +106,11 @@ public record MTLDevice(MemorySegment handle) {
         return Math.toIntExact(Math.min(
                 Integer.MAX_VALUE,
                 MAXIMUM_CONCURRENT_COMPILATION_TASK_COUNT.sendLong(handle)));
+    }
+
+    public boolean isDepth24Stencil8PixelFormatSupported() {
+        return !ObjC.respondsToSelector(handle, "isDepth24Stencil8PixelFormatSupported")
+                || DEPTH24_STENCIL8_SUPPORTED.sendBoolean(handle);
     }
 
     public MTLBuffer newBuffer(final long length, final long options) {

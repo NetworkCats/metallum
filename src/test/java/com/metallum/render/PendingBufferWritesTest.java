@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import java.nio.ByteBuffer;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -31,5 +32,20 @@ final class PendingBufferWritesTest {
         ByteBuffer output = ByteBuffer.allocate(4);
         writes.applyTo(output);
         assertArrayEquals(new byte[]{1, 2, 3, 4}, output.array());
+    }
+
+    @Test
+    void manyAdjacentWritesDoNotRequireCoalescingCopies() {
+        PendingBufferWrites writes = new PendingBufferWrites();
+        for (int i = 0; i < 1024; i++) {
+            writes.add(11L, 1024L, i, ByteBuffer.wrap(new byte[]{(byte) i}));
+        }
+
+        assertTrue(writes.coversWholeBuffer(1024L));
+        ByteBuffer output = ByteBuffer.allocate(1024);
+        writes.applyTo(output);
+        for (int i = 0; i < 1024; i++) {
+            assertEquals((byte) i, output.get(i));
+        }
     }
 }

@@ -283,8 +283,7 @@ final class MetalCrossShaderCompiler {
 
             long typeHandle = Spvc.spvc_compiler_get_type_handle(compiler, input.type_id());
             int baseType = Spvc.spvc_type_get_basetype(typeHandle);
-            if (baseType != Spvc.SPVC_BASETYPE_INT8 && baseType != Spvc.SPVC_BASETYPE_INT16
-                    && baseType != Spvc.SPVC_BASETYPE_INT32 && baseType != Spvc.SPVC_BASETYPE_INT64) {
+            if (!isIntegerBaseType(baseType)) {
                 continue;
             }
 
@@ -296,6 +295,13 @@ final class MetalCrossShaderCompiler {
             var.rate(Spvc.SPVC_MSL_SHADER_VARIABLE_RATE_PER_VERTEX);
             checkSpvc(Spvc.spvc_compiler_msl_add_shader_input_2(compiler, var), "spvc_compiler_msl_add_shader_input_2");
         }
+    }
+
+    static boolean isIntegerBaseType(final int baseType) {
+        return baseType == Spvc.SPVC_BASETYPE_INT8 || baseType == Spvc.SPVC_BASETYPE_UINT8
+                || baseType == Spvc.SPVC_BASETYPE_INT16 || baseType == Spvc.SPVC_BASETYPE_UINT16
+                || baseType == Spvc.SPVC_BASETYPE_INT32 || baseType == Spvc.SPVC_BASETYPE_UINT32
+                || baseType == Spvc.SPVC_BASETYPE_INT64 || baseType == Spvc.SPVC_BASETYPE_UINT64;
     }
 
     private static MslShader spirvToMsl(

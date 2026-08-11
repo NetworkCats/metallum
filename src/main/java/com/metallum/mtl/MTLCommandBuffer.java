@@ -131,6 +131,40 @@ public final class MTLCommandBuffer {
             final double viewportWidth,
             final double viewportHeight
     ) {
+        return makeRenderCommandEncoder(
+                colorTexture, 0L, clearColor,
+                depthTexture, 0L, clearDepth,
+                viewportWidth, viewportHeight);
+    }
+
+    public MTLRenderCommandEncoder makeRenderCommandEncoder(
+            final MemorySegment colorTexture,
+            final long colorMipLevel,
+            @Nullable final Vector4fc clearColor,
+            final MemorySegment depthTexture,
+            final long depthMipLevel,
+            @Nullable final Double clearDepth,
+            final double viewportWidth,
+            final double viewportHeight
+    ) {
+        return makeRenderCommandEncoder(
+                colorTexture, colorMipLevel, 0L, clearColor,
+                depthTexture, depthMipLevel, 0L, clearDepth,
+                viewportWidth, viewportHeight);
+    }
+
+    public MTLRenderCommandEncoder makeRenderCommandEncoder(
+            final MemorySegment colorTexture,
+            final long colorMipLevel,
+            final long colorSlice,
+            @Nullable final Vector4fc clearColor,
+            final MemorySegment depthTexture,
+            final long depthMipLevel,
+            final long depthSlice,
+            @Nullable final Double clearDepth,
+            final double viewportWidth,
+            final double viewportHeight
+    ) {
         if (ObjC.isNil(colorTexture) && ObjC.isNil(depthTexture)) {
             throw new IllegalStateException("Render pass requires a color or depth attachment");
         }
@@ -141,6 +175,8 @@ public final class MTLCommandBuffer {
                     renderPass.colorAttachment(
                             0,
                             colorTexture,
+                            colorMipLevel,
+                            colorSlice,
                             clearColor != null ? MTLRenderPassDescriptor.LOAD_ACTION_CLEAR : MTLRenderPassDescriptor.LOAD_ACTION_LOAD,
                             MTLRenderPassDescriptor.STORE_ACTION_STORE,
                             clearColor
@@ -149,6 +185,8 @@ public final class MTLCommandBuffer {
                 if (!ObjC.isNil(depthTexture)) {
                     renderPass.depthAttachment(
                             depthTexture,
+                            depthMipLevel,
+                            depthSlice,
                             clearDepth != null ? MTLRenderPassDescriptor.LOAD_ACTION_CLEAR : MTLRenderPassDescriptor.LOAD_ACTION_LOAD,
                             MTLRenderPassDescriptor.STORE_ACTION_STORE,
                             clearDepth
@@ -156,6 +194,8 @@ public final class MTLCommandBuffer {
                     if (MTLPixelFormat.hasStencil(MTLTexture.pixelFormat(depthTexture))) {
                         renderPass.stencilAttachment(
                                 depthTexture,
+                                depthMipLevel,
+                                depthSlice,
                                 MTLRenderPassDescriptor.LOAD_ACTION_DONT_CARE,
                                 MTLRenderPassDescriptor.STORE_ACTION_DONT_CARE
                         );
@@ -319,16 +359,28 @@ public final class MTLCommandBuffer {
         long alignedOffset = alignUp(this.inlineOffset, INLINE_ALIGNMENT);
         if (this.inlineBuffer == null || length > this.inlineCapacity - alignedOffset) {
             long capacity = Math.max(INLINE_ARENA_SIZE, alignUp(length, INLINE_ALIGNMENT));
-            this.inlineBuffer = this.device.newBuffer(
+            MTLBuffer created = this.device.newBuffer(
                     capacity,
                     MTLResourceOptions.of(MTLStorageMode.Shared, MTLHazardTrackingMode.Untracked)
             );
+            boolean tracked = false;
+            try {
+                if (this.residencySet != null) {
+                    this.residencySet.addAllocation(created.handle());
+                    tracked = true;
+                }
+                this.inlineAllocations.add(created.handle());
+            } catch (RuntimeException | Error exception) {
+                if (tracked) {
+                    this.residencySet.removeAllocationAndRelease(created.handle());
+                } else {
+                    ObjC.release(created.handle());
+                }
+                throw exception;
+            }
+            this.inlineBuffer = created;
             this.inlineCapacity = capacity;
             alignedOffset = 0L;
-            if (this.residencySet != null) {
-                this.residencySet.addAllocation(this.inlineBuffer.handle());
-            }
-            this.inlineAllocations.add(this.inlineBuffer.handle());
         }
         MemorySegment destination = this.inlineBuffer.contents();
         if (ObjC.isNil(destination)) {
@@ -360,8 +412,11 @@ public final class MTLCommandBuffer {
     public void pushDebugGroup(final String label) {
         try (AutoreleasePool _ = AutoreleasePool.push()) {
             MemorySegment nsLabel = ObjC.nsString(label == null ? "" : label);
-            PUSH_DEBUG_GROUP.send(handle(), nsLabel);
-            ObjC.release(nsLabel);
+            try {
+                PUSH_DEBUG_GROUP.send(handle(), nsLabel);
+            } finally {
+                ObjC.release(nsLabel);
+            }
         }
     }
 

@@ -75,9 +75,11 @@ public final class Stats {
             return;
         }
         LongAdder adder = COUNTERS[counter.ordinal()];
-        long current = adder.sum();
-        if (value > current) {
-            adder.add(value - current);
+        synchronized (adder) {
+            long current = adder.sum();
+            if (value > current) {
+                adder.add(value - current);
+            }
         }
     }
 

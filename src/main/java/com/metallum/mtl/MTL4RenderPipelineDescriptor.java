@@ -67,14 +67,20 @@ public final class MTL4RenderPipelineDescriptor implements AutoCloseable {
             final MemorySegment fragmentLibrary,
             final String fragmentEntry
     ) {
-        MemorySegment vertex = functionDescriptor(vertexLibrary, vertexEntry);
-        MemorySegment fragment = functionDescriptor(fragmentLibrary, fragmentEntry);
+        MemorySegment vertex = MemorySegment.NULL;
+        MemorySegment fragment = MemorySegment.NULL;
         try {
+            vertex = functionDescriptor(vertexLibrary, vertexEntry);
+            fragment = functionDescriptor(fragmentLibrary, fragmentEntry);
             SET_VERTEX_FUNCTION_DESCRIPTOR.send(handle(), vertex);
             SET_FRAGMENT_FUNCTION_DESCRIPTOR.send(handle(), fragment);
         } finally {
-            ObjC.release(vertex);
-            ObjC.release(fragment);
+            if (!ObjC.isNil(vertex)) {
+                ObjC.release(vertex);
+            }
+            if (!ObjC.isNil(fragment)) {
+                ObjC.release(fragment);
+            }
         }
     }
 
@@ -142,8 +148,9 @@ public final class MTL4RenderPipelineDescriptor implements AutoCloseable {
         if (ObjC.isNil(descriptor)) {
             throw new IllegalStateException("Failed to create MTL4LibraryFunctionDescriptor");
         }
-        MemorySegment nsName = ObjC.nsString(entry);
+        MemorySegment nsName = MemorySegment.NULL;
         try {
+            nsName = ObjC.nsString(entry);
             SET_LIBRARY.send(descriptor, library);
             SET_NAME.send(descriptor, nsName);
             return descriptor;
@@ -151,7 +158,9 @@ public final class MTL4RenderPipelineDescriptor implements AutoCloseable {
             ObjC.release(descriptor);
             throw exception;
         } finally {
-            ObjC.release(nsName);
+            if (!ObjC.isNil(nsName)) {
+                ObjC.release(nsName);
+            }
         }
     }
 

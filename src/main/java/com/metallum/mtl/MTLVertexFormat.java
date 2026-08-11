@@ -74,6 +74,10 @@ public enum MTLVertexFormat {
             case RGBA32_FLOAT -> Float4;
             case RGBA8_UNORM -> UChar4Normalized;
             case RGBA8_UINT -> UChar4;
+            case RG8_UNORM -> UChar2Normalized;
+            case RG8_SNORM -> Char2Normalized;
+            case RG8_UINT -> UChar2;
+            case RG8_SINT -> Char2;
             case RG16_UINT -> UShort2;
             case RG16_UNORM -> UShort2Normalized;
             case RG16_SINT -> Short2;
@@ -112,6 +116,8 @@ public enum MTLVertexFormat {
             case RGB16_UNORM -> UShort3Normalized;
             case RGB16_SNORM -> Short3Normalized;
             case RGB16_FLOAT -> Half3;
+            case RG11B10_FLOAT -> FloatRG11B10;
+            case RGB10A2_UNORM -> UInt1010102Normalized;
             default -> Invalid;
         };
     }

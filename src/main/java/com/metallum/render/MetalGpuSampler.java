@@ -99,7 +99,14 @@ final class MetalGpuSampler extends GpuSampler {
         return this.closed;
     }
 
+    boolean belongsTo(final MetalDevice device) {
+        return this.device == device;
+    }
+
     MemorySegment nativeHandle() {
+        if (this.closed) {
+            throw new IllegalStateException("Metal sampler is closed");
+        }
         return this.nativeHandle;
     }
 

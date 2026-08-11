@@ -38,6 +38,7 @@ public enum MTLPixelFormat {
     RGBA8Sint(74L),
 
     RGB10A2Unorm(90L),
+    RGB10A2Uint(91L),
     RG11B10Float(92L),
 
     RG32Uint(103L),
@@ -104,6 +105,7 @@ public enum MTLPixelFormat {
             case RGBA8_UINT -> RGBA8Uint;
             case RGBA8_SINT -> RGBA8Sint;
             case RGB10A2_UNORM -> RGB10A2Unorm;
+            case RGB10A2_UINT -> RGB10A2Uint;
             case RG11B10_FLOAT -> RG11B10Float;
             case RG32_UINT -> RG32Uint;
             case RG32_SINT -> RG32Sint;

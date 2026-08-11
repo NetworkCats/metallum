@@ -41,6 +41,7 @@ final class MetalDevice implements GpuDeviceBackend {
     private static final AtomicInteger COMPILER_THREAD_IDS = new AtomicInteger();
     private final MemorySegment metalDeviceHandle;
     private final MTLDevice metalDevice;
+    private final long maxBufferLength;
     private final CAMetalLayer metalLayer;
     private final Cocoa cocoa;
     private final GpuDebugOptions debugOptions;
@@ -82,55 +83,117 @@ final class MetalDevice implements GpuDeviceBackend {
         this.debugOptions = debugOptions;
         this.metalDeviceHandle = metalDeviceHandle;
         this.metalDevice = new MTLDevice(metalDeviceHandle);
+        this.maxBufferLength = this.metalDevice.maxBufferLength();
         this.metalLayer = metalLayer;
         this.cocoa = cocoa;
         this.metal4Available = this.metalDevice.supportsMetal4();
         this.forceMetal3 = Boolean.getBoolean("metallum.forceMetal3");
-        this.concurrentCompilationEnabled = this.metalDevice.enableConcurrentCompilation();
-        this.compilationExecutor = newCompilationExecutor();
-        this.residencySet = MTLResidencySet.create(
-                this.metalDevice,
-                4096L,
-                this.useLabels() ? "Metallum live resources" : null
-        );
-        MTLCommandQueue.setDebugLabelsEnabled(this.useLabels());
-        MTLCommandQueue selectedQueue = this.metalDevice.newCommandQueue(
-                this.metal4Available && !this.forceMetal3 && this.residencySet != null
-        );
-        PipelineCacheIdentity selectedCacheIdentity = PipelineCacheIdentity.create(
-                this.metalDevice, selectedQueue.isMetal4());
-        MTL4Compiler selectedCompiler = selectedQueue.isMetal4()
-                ? MTL4Compiler.create(
-                this.metalDevice,
-                this.useLabels() ? "Metallum shader compiler" : null,
-                selectedCacheIdentity.archivePath()
-        )
-                : null;
-        if (selectedQueue.isMetal4() && selectedCompiler == null) {
-            Metallum.LOGGER.warn("[metallum] Metal 4 compiler is unavailable; falling back to the complete Metal 3 path");
-            selectedQueue.close();
-            selectedQueue = this.metalDevice.newCommandQueue(false);
-            selectedCacheIdentity = PipelineCacheIdentity.create(this.metalDevice, false);
+
+        ExecutorService selectedExecutor = null;
+        MTLResidencySet selectedResidencySet = null;
+        MTLCommandQueue selectedQueue = null;
+        MTL4Compiler selectedCompiler = null;
+        MTLBinaryArchive selectedArchive = null;
+        MetalCommandEncoder selectedEncoder = null;
+        boolean residencyAttached = false;
+        boolean builtinsInitialized = false;
+        try {
+            this.concurrentCompilationEnabled = this.metalDevice.enableConcurrentCompilation();
+            selectedExecutor = newCompilationExecutor();
+            this.compilationExecutor = selectedExecutor;
+            selectedResidencySet = MTLResidencySet.create(
+                    this.metalDevice,
+                    4096L,
+                    this.useLabels() ? "Metallum live resources" : null
+            );
+            this.residencySet = selectedResidencySet;
+            MTLCommandQueue.setDebugLabelsEnabled(this.useLabels());
+            selectedQueue = this.metalDevice.newCommandQueue(
+                    this.metal4Available && !this.forceMetal3 && selectedResidencySet != null
+            );
+            PipelineCacheIdentity selectedCacheIdentity = PipelineCacheIdentity.create(
+                    this.metalDevice, selectedQueue.isMetal4());
+            selectedCompiler = selectedQueue.isMetal4()
+                    ? MTL4Compiler.create(
+                    this.metalDevice,
+                    this.useLabels() ? "Metallum shader compiler" : null,
+                    selectedCacheIdentity.archivePath()
+            )
+                    : null;
+            if (selectedQueue.isMetal4() && selectedCompiler == null) {
+                Metallum.LOGGER.warn("[metallum] Metal 4 compiler is unavailable; falling back to the complete Metal 3 path");
+                selectedQueue.close();
+                selectedQueue = this.metalDevice.newCommandQueue(false);
+                selectedCacheIdentity = PipelineCacheIdentity.create(this.metalDevice, false);
+            }
+            this.commandQueue = selectedQueue;
+            this.metal4CommandPath = selectedQueue.isMetal4();
+            this.metal4Compiler = selectedCompiler;
+            this.pipelineCacheIdentity = selectedCacheIdentity;
+            selectedArchive = this.metal4CommandPath
+                    ? null
+                    : MTLBinaryArchive.create(this.metalDevice, selectedCacheIdentity.archivePath());
+            this.metal3Archive = selectedArchive;
+            if (selectedResidencySet != null) {
+                selectedQueue.addResidencySet(selectedResidencySet);
+                residencyAttached = true;
+                selectedQueue.useUnretainedCommandBuffers(true);
+            }
+            MTLBuiltinPipelines.init(
+                    this.metalDevice,
+                    selectedResidencySet,
+                    selectedCompiler,
+                    selectedArchive
+            );
+            builtinsInitialized = true;
+            selectedEncoder = new MetalCommandEncoder(this);
+            this.commandEncoder = selectedEncoder;
+            this.deviceInfo = buildDeviceInfo(deviceName);
+        } catch (Throwable throwable) {
+            if (selectedEncoder != null) {
+                try {
+                    selectedEncoder.close();
+                } catch (Throwable cleanupFailure) {
+                    throwable.addSuppressed(cleanupFailure);
+                }
+            }
+            if (builtinsInitialized) {
+                try {
+                    MTLBuiltinPipelines.close();
+                } catch (Throwable cleanupFailure) {
+                    throwable.addSuppressed(cleanupFailure);
+                }
+            }
+            closeAfterFailedInitialization(selectedArchive, throwable);
+            closeAfterFailedInitialization(selectedCompiler, throwable);
+            if (residencyAttached && selectedQueue != null && selectedResidencySet != null) {
+                try {
+                    selectedQueue.removeResidencySet(selectedResidencySet);
+                } catch (Throwable cleanupFailure) {
+                    throwable.addSuppressed(cleanupFailure);
+                }
+            }
+            closeAfterFailedInitialization(selectedResidencySet, throwable);
+            closeAfterFailedInitialization(selectedQueue, throwable);
+            if (selectedExecutor != null) {
+                selectedExecutor.shutdownNow();
+            }
+            throw throwable;
         }
-        this.commandQueue = selectedQueue;
-        this.metal4CommandPath = selectedQueue.isMetal4();
-        this.metal4Compiler = selectedCompiler;
-        this.pipelineCacheIdentity = selectedCacheIdentity;
-        this.metal3Archive = this.metal4CommandPath
-                ? null
-                : MTLBinaryArchive.create(this.metalDevice, selectedCacheIdentity.archivePath());
-        if (this.residencySet != null) {
-            this.commandQueue.addResidencySet(this.residencySet);
-            this.commandQueue.useUnretainedCommandBuffers(true);
+    }
+
+    private static void closeAfterFailedInitialization(
+            @Nullable final AutoCloseable resource,
+            final Throwable failure
+    ) {
+        if (resource == null) {
+            return;
         }
-        MTLBuiltinPipelines.init(
-                this.metalDevice,
-                this.metal4CommandPath ? this.residencySet : null,
-                this.metal4Compiler,
-                this.metal3Archive
-        );
-        this.commandEncoder = new MetalCommandEncoder(this);
-        this.deviceInfo = buildDeviceInfo(deviceName);
+        try {
+            resource.close();
+        } catch (Throwable cleanupFailure) {
+            failure.addSuppressed(cleanupFailure);
+        }
     }
 
     @Override
@@ -178,6 +241,12 @@ final class MetalDevice implements GpuDeviceBackend {
             final int depthOrLayers,
             final int mipLevels
     ) {
+        MetalResourceValidation.texture(usage, width, height, depthOrLayers, mipLevels);
+        if (format == GpuFormat.D24_UNORM_S8_UINT
+                && !this.metalDevice.isDepth24Stencil8PixelFormatSupported()) {
+            throw new IllegalArgumentException(
+                    "This Metal device does not support D24_UNORM_S8_UINT; use D32_FLOAT_S8_UINT");
+        }
         return new MetalGpuTexture(this, usage, label == null ? "" : label, format, width, height, depthOrLayers, mipLevels);
     }
 
@@ -188,12 +257,23 @@ final class MetalDevice implements GpuDeviceBackend {
 
     @Override
     public @NonNull GpuTextureView createTextureView(final @NonNull GpuTexture texture, final int baseMipLevel, final int mipLevels) {
+        if (!(texture instanceof MetalGpuTexture metalTexture)) {
+            throw new IllegalArgumentException("Metal device cannot create a view of a foreign texture");
+        }
+        if (!metalTexture.belongsTo(this)) {
+            throw new IllegalArgumentException("Cannot create a texture view for another Metal device");
+        }
+        if (metalTexture.isClosed()) {
+            throw new IllegalStateException("Cannot create a view of a closed texture");
+        }
+        MetalResourceValidation.textureView(texture.getMipLevels(), baseMipLevel, mipLevels);
         return new MetalGpuTextureView(texture, baseMipLevel, mipLevels);
     }
 
     @Override
     public @NonNull GpuBuffer createBuffer(@Nullable final Supplier<String> label, @GpuBuffer.Usage final int usage, final long size) {
-        return new MetalGpuBuffer(this, usage, size);
+        long allocationSize = MetalResourceValidation.bufferAllocationSize(usage, size, this.maxBufferLength);
+        return new MetalGpuBuffer(this, usage, size, allocationSize);
     }
 
     @Override
@@ -283,15 +363,26 @@ final class MetalDevice implements GpuDeviceBackend {
 
     @Override
     public void close() {
-        this.waitForSubmittedGpuWork();
         synchronized (this.compilationBatchLock) {
+            if (this.closing) {
+                return;
+            }
             this.closing = true;
+        }
+        try {
+            this.waitForSubmittedGpuWork();
+        } catch (Throwable throwable) {
+            synchronized (this.compilationBatchLock) {
+                this.closing = false;
+            }
+            throw throwable;
         }
         closePipelineCaches();
         try {
             this.cocoa.clearViewLayer();
         } catch (Throwable ignored) {
         }
+        this.metalLayer.close();
         MTLBuiltinPipelines.close();
         if (this.metal4Compiler != null) {
             this.metal4Compiler.close();
@@ -380,6 +471,10 @@ final class MetalDevice implements GpuDeviceBackend {
         }
     }
 
+    void discardPendingClears(final MetalGpuTexture texture) {
+        this.commandEncoder.discardPendingClears(texture);
+    }
+
     void recordCommandError(final String message) {
         if (this.debugMessages.size() == 64) {
             this.debugMessages.removeFirst();
@@ -437,16 +532,21 @@ final class MetalDevice implements GpuDeviceBackend {
 
     MetalCompiledRenderPipeline getOrCompilePipeline(final RenderPipeline pipeline) {
         CacheGeneration generation;
+        CompletableFuture<MetalCompiledRenderPipeline> pending = null;
         synchronized (this.compilationBatchLock) {
             CompilationBatch batch = this.compilationBatch;
             if (batch != null) {
-                CompletableFuture<MetalCompiledRenderPipeline> pending = batch.future(pipeline);
-                if (pending != null) {
-                    return joinCompiledPipeline(pipeline, pending);
-                }
+                pending = batch.future(pipeline);
             }
-            generation = this.activeGeneration;
-            generation.retain();
+            if (pending == null) {
+                generation = this.activeGeneration;
+                generation.retain();
+            } else {
+                generation = null;
+            }
+        }
+        if (pending != null) {
+            return joinCompiledPipeline(pipeline, pending);
         }
         try {
             MetalCompiledRenderPipeline cached = generation.compiledPipelines.get(pipeline);
@@ -822,7 +922,7 @@ final class MetalDevice implements GpuDeviceBackend {
                     : "; Metal 4 available; Metal 3 command path"
                 : "; Metal 3")
                 + (this.residencySet != null ? "; explicit residency" : "");
-        long maxMemoryAllocationSize = Math.min(metalDevice.maxBufferLength(), metalDevice.recommendedMaxWorkingSetSize());
+        long maxMemoryAllocationSize = Math.min(this.maxBufferLength, metalDevice.recommendedMaxWorkingSetSize());
         return new DeviceInfo(
                 deviceName,
                 "Apple",

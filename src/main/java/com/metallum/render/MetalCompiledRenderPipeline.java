@@ -49,6 +49,7 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
     private final MTLPrimitiveType topology;
     private final int vertexBufferCount;
     private final boolean supportsIndirectCommands;
+    private final boolean depthAttachmentRequired;
 
     private final MemorySegment depthStencilState;
     private final MemorySegment withDepthPipeline;
@@ -102,6 +103,7 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
         MTLCompareFunction depthCompareOp;
         int depthWrite;
         var depthStencilState = info.getDepthStencilState();
+        this.depthAttachmentRequired = depthStencilState != null;
         if (depthStencilState == null) {
             depthCompareOp = MTLCompareFunction.Always;
             depthWrite = 0;
@@ -176,16 +178,23 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
                 }
 
                 MemorySegment withoutDepth = MemorySegment.NULL;
-                if (depthStencilState == null) {
-                    withoutDepth = createPipeline(device, info, vertexFunction, fragmentFunction,
-                            vertexDescriptor, colorFormat, MTLPixelFormat.Invalid,
-                            requestIndirectCommands, pipelineCacheKey);
-                    if (ObjC.isNil(withoutDepth) && requestIndirectCommands) {
-                        requestIndirectCommands = false;
+                try {
+                    if (depthStencilState == null) {
                         withoutDepth = createPipeline(device, info, vertexFunction, fragmentFunction,
                                 vertexDescriptor, colorFormat, MTLPixelFormat.Invalid,
-                                false, pipelineCacheKey);
+                                requestIndirectCommands, pipelineCacheKey);
+                        if (ObjC.isNil(withoutDepth) && requestIndirectCommands) {
+                            requestIndirectCommands = false;
+                            withoutDepth = createPipeline(device, info, vertexFunction, fragmentFunction,
+                                    vertexDescriptor, colorFormat, MTLPixelFormat.Invalid,
+                                    false, pipelineCacheKey);
+                        }
                     }
+                } catch (Throwable throwable) {
+                    if (!ObjC.isNil(withDepth)) {
+                        device.releaseAllocationNow(withDepth);
+                    }
+                    throw throwable;
                 }
                 this.withDepthPipeline = withDepth;
                 this.withoutDepthPipeline = withoutDepth;
@@ -251,7 +260,12 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
             if (ObjC.isNil(pipeline)) {
                 Metallum.LOGGER.error("[metallum] Metal 4 pipeline {} failed to build", info.getLocation());
             } else {
-                device.trackAllocation(pipeline);
+                try {
+                    device.trackAllocation(pipeline);
+                } catch (RuntimeException exception) {
+                    ObjC.release(pipeline);
+                    throw exception;
+                }
             }
             return pipeline;
         }
@@ -308,8 +322,13 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
             MemorySegment pipeline = device.metalDevice().newRenderPipelineStateAsync(pipelineDesc);
             if (ObjC.isNil(pipeline)) {
                 Metallum.LOGGER.error("[metallum] Pipeline {} failed to build with depth format {}", info.getLocation(), depthFormat);
-            } else if (device.usesMetal4CommandPath()) {
-                device.trackAllocation(pipeline);
+            } else if (device.usesExplicitResidency()) {
+                try {
+                    device.trackAllocation(pipeline);
+                } catch (RuntimeException exception) {
+                    ObjC.release(pipeline);
+                    throw exception;
+                }
             }
             return pipeline;
         }
@@ -317,7 +336,8 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
 
     @Override
     public boolean isValid() {
-        return !ObjC.isNil(this.withDepthPipeline);
+        return !ObjC.isNil(this.withDepthPipeline)
+                && (this.depthAttachmentRequired || !ObjC.isNil(this.withoutDepthPipeline));
     }
 
     List<ResourceBinding> resources() {
@@ -461,7 +481,7 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
     }
 
     private void releasePipeline(final MemorySegment pipeline) {
-        if (this.device.usesMetal4CommandPath()) {
+        if (this.device.usesExplicitResidency()) {
             this.device.queueAllocationRelease(pipeline);
         } else {
             this.device.queueResourceRelease(pipeline);

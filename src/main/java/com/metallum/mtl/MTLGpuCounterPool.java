@@ -100,8 +100,15 @@ public final class MTLGpuCounterPool implements AutoCloseable {
                 if (ObjC.isNil(heap)) {
                     return null;
                 }
-                long frequency = QUERY_TIMESTAMP_FREQUENCY.sendLong(device.handle());
-                return new MTLGpuCounterPool(device, heap, true, frequency, 0L, 0L);
+                try {
+                    long frequency = QUERY_TIMESTAMP_FREQUENCY.sendLong(device.handle());
+                    long[] timestamps = sampleClockPair(device.handle());
+                    return new MTLGpuCounterPool(
+                            device, heap, true, frequency, timestamps[0], timestamps[1]);
+                } catch (RuntimeException exception) {
+                    ObjC.release(heap);
+                    throw exception;
+                }
             } finally {
                 ObjC.release(descriptor);
             }
@@ -136,9 +143,14 @@ public final class MTLGpuCounterPool implements AutoCloseable {
                 if (ObjC.isNil(sampleBuffer)) {
                     return null;
                 }
-                long[] timestamps = sampleClockPair(device.handle());
-                return new MTLGpuCounterPool(
-                        device, sampleBuffer, false, 0L, timestamps[0], timestamps[1]);
+                try {
+                    long[] timestamps = sampleClockPair(device.handle());
+                    return new MTLGpuCounterPool(
+                            device, sampleBuffer, false, 0L, timestamps[0], timestamps[1]);
+                } catch (RuntimeException exception) {
+                    ObjC.release(sampleBuffer);
+                    throw exception;
+                }
             } finally {
                 ObjC.release(descriptor);
             }
@@ -190,10 +202,12 @@ public final class MTLGpuCounterPool implements AutoCloseable {
 
     private long toNanoseconds(final long raw, @Nullable final long[] finalPair) {
         if (this.metal4) {
-            if (this.frequency <= 0L) {
+            if (this.frequency <= 0L || this.initialCpuTimestamp == 0L) {
                 return raw;
             }
-            return Math.round((double) raw * 1_000_000_000.0 / (double) this.frequency);
+            return this.initialCpuTimestamp + Math.round(
+                    (double) (raw - this.initialGpuTimestamp)
+                            * 1_000_000_000.0 / (double) this.frequency);
         }
         if (finalPair == null) {
             return raw;

@@ -291,9 +291,14 @@ public final class MTL4Compiler implements AutoCloseable {
         if (ObjC.isNil(options)) {
             return MemorySegment.NULL;
         }
-        MemorySegment archives = ARRAY_WITH_OBJECT.sendPtr(ARRAY_CLASS, archive);
-        SET_LOOKUP_ARCHIVES.send(options, archives);
-        return options;
+        try {
+            MemorySegment archives = ARRAY_WITH_OBJECT.sendPtr(ARRAY_CLASS, archive);
+            SET_LOOKUP_ARCHIVES.send(options, archives);
+            return options;
+        } catch (RuntimeException exception) {
+            ObjC.release(options);
+            throw exception;
+        }
     }
 
     private static MemorySegment fileUrl(final Path path) {

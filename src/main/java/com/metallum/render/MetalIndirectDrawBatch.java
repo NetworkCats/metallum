@@ -40,6 +40,10 @@ public final class MetalIndirectDrawBatch extends MultiDrawBatch {
         if (index < 0 || index >= this.indexCounts.length) {
             throw new IndexOutOfBoundsException(index);
         }
+        if (indexCount < 0 || firstIndex < 0L) {
+            throw new IllegalArgumentException(
+                    "Indirect indexed draw count and first index must not be negative");
+        }
         this.indexCounts[index] = indexCount;
         this.baseVertices[index] = baseVertex;
         this.firstIndices[index] = firstIndex;
@@ -98,6 +102,24 @@ public final class MetalIndirectDrawBatch extends MultiDrawBatch {
                 pass.drawIndexed(this.indexCounts[i], 1,
                         Math.toIntExact(this.firstIndices[i]), this.baseVertices[i], 0);
             }
+        }
+    }
+
+    void validateIndexRanges(final MTLIndexType indexType, final long bufferSize) {
+        if (this.size < 0 || this.size > this.indexCounts.length) {
+            throw new IllegalStateException(
+                    "Indirect draw batch size " + this.size + " exceeds capacity " + this.indexCounts.length);
+        }
+        for (int i = 0; i < this.size; i++) {
+            long offset;
+            long length;
+            try {
+                offset = Math.multiplyExact(this.firstIndices[i], indexType.bytes);
+                length = Math.multiplyExact((long) this.indexCounts[i], indexType.bytes);
+            } catch (ArithmeticException exception) {
+                throw new IllegalArgumentException("Indirect indexed draw byte range overflows", exception);
+            }
+            BufferCopySupport.requireRange(offset, length, bufferSize, "Indirect indexed draw " + i);
         }
     }
 

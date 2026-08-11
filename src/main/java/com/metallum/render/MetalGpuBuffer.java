@@ -37,18 +37,34 @@ class MetalGpuBuffer extends GpuBuffer {
     private long writableSubmit = -1L;
     private boolean backingUsedByGpu;
     private final PendingBufferWrites pendingWrites = new PendingBufferWrites();
+    @Nullable
+    private CpuBufferMirror indexMirror;
 
-    MetalGpuBuffer(final MetalDevice device, @GpuBuffer.Usage final int usage, final long size) {
+    MetalGpuBuffer(
+            final MetalDevice device,
+            @GpuBuffer.Usage final int usage,
+            final long size,
+            final long allocationSize
+    ) {
         super(usage, size);
         this.device = device;
 
         this.dynamic = isDynamic(usage);
         this.cpuAccessible = isCpuAccessible(usage) || this.dynamic;
         this.resourceOptions = toMtlResourceOptions(usage);
-        this.allocationSize = (size + 15L) & ~15L;
-        this.nativeBuffer = device.metalDevice().newBuffer(this.allocationSize, this.resourceOptions);
+        this.allocationSize = allocationSize;
+        this.indexMirror = (usage & GpuBuffer.USAGE_INDEX) != 0 && size <= Integer.MAX_VALUE
+                ? new CpuBufferMirror((int) size)
+                : null;
+        MTLBuffer created = device.metalDevice().newBuffer(this.allocationSize, this.resourceOptions);
+        try {
+            device.trackAllocation(created.handle());
+        } catch (RuntimeException exception) {
+            ObjC.release(created.handle());
+            throw exception;
+        }
+        this.nativeBuffer = created;
         Stats.increment(Stats.Counter.NATIVE_RESOURCES_CREATED);
-        device.trackAllocation(this.nativeBuffer.handle());
 
         if (this.cpuAccessible) {
             MemorySegment contents = this.nativeBuffer.contents();
@@ -73,16 +89,18 @@ class MetalGpuBuffer extends GpuBuffer {
         this.allocationSize = size;
         this.nativeBuffer = wrappedBuffer;
         this.storage = null;
+        this.indexMirror = null;
     }
 
     ByteBuffer sliceStorage(final long offset, final long length) {
         if (this.storage == null) {
             throw new IllegalStateException("Buffer is not CPU-accessible");
         }
+        BufferCopySupport.requireRange(offset, length, this.size(), "CPU buffer mapping");
 
         return storage.duplicate()
                 .position(Math.toIntExact(offset))
-                .limit(Math.toIntExact(offset + length))
+                .limit(Math.toIntExact(Math.addExact(offset, length)))
                 .slice()
                 .order(this.storage.order());
     }
@@ -92,6 +110,10 @@ class MetalGpuBuffer extends GpuBuffer {
             throw new IllegalStateException("Native Metal buffer is closed");
         }
         return this.nativeBuffer;
+    }
+
+    boolean belongsTo(final MetalDevice device) {
+        return this.device == device;
     }
 
     MemorySegment nativeHandle() {
@@ -154,6 +176,53 @@ class MetalGpuBuffer extends GpuBuffer {
         this.pendingWrites.applyTo(destination);
     }
 
+    void mirrorWrite(final long offset, final ByteBuffer source) {
+        if (this.indexMirror != null) {
+            this.indexMirror.write(offset, source);
+        }
+    }
+
+    void mirrorCopyFrom(
+            final MetalGpuBuffer source,
+            final long sourceOffset,
+            final long targetOffset,
+            final long length
+    ) {
+        if (this.indexMirror != null) {
+            if (source.indexMirror != null) {
+                this.indexMirror.copyFrom(source.indexMirror, sourceOffset, targetOffset, length);
+            } else {
+                ByteBuffer knownSource = source.knownCpuData(sourceOffset, length);
+                if (knownSource == null) {
+                    this.indexMirror.invalidate(targetOffset, length);
+                } else {
+                    this.indexMirror.write(targetOffset, knownSource);
+                }
+            }
+        }
+    }
+
+    @Nullable
+    ByteBuffer knownCpuData(final long offset, final long length) {
+        return this.indexMirror == null ? null : this.indexMirror.readIfInitialized(offset, length);
+    }
+
+    void invalidateMirror(final long offset, final long length) {
+        if (this.indexMirror != null) {
+            this.indexMirror.invalidate(offset, length);
+        }
+    }
+
+    ByteBuffer indexData(final long offset, final long length) {
+        if (this.isClosed()) {
+            throw new IllegalStateException("Index buffer is closed");
+        }
+        if (this.indexMirror == null) {
+            throw new IllegalStateException("Index buffer is too large to maintain a CPU mirror");
+        }
+        return this.indexMirror.read(offset, length);
+    }
+
     MemorySegment texelTextureView(
             final MTLPixelFormat format,
             final long offset,
@@ -181,7 +250,12 @@ class MetalGpuBuffer extends GpuBuffer {
                 byteLength
         );
         if (!ObjC.isNil(created)) {
-            this.texelViews.put(key, created);
+            try {
+                this.texelViews.put(key, created);
+            } catch (RuntimeException exception) {
+                ObjC.release(created);
+                throw exception;
+            }
             Stats.increment(Stats.Counter.NATIVE_RESOURCES_CREATED);
         }
         return created;
@@ -199,6 +273,7 @@ class MetalGpuBuffer extends GpuBuffer {
         }
         this.closed = true;
         this.storage = null;
+        this.indexMirror = null;
         this.backingUsedByGpu = true;
         this.pendingWrites.clear();
         releaseTexelViews();
@@ -224,7 +299,11 @@ class MetalGpuBuffer extends GpuBuffer {
             throw new IllegalStateException("Buffer is not writable");
         }
         ByteBuffer mapped = this.sliceStorage(offset, length);
+        ByteBuffer mappedForMirror = mapped.duplicate();
         return new GpuBufferSlice.MappedView(this.slice(offset, length), mapped, () -> {
+            if (write) {
+                mirrorWrite(offset, mappedForMirror);
+            }
         });
     }
 
