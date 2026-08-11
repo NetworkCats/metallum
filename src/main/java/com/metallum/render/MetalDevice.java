@@ -141,7 +141,7 @@ final class MetalDevice implements GpuDeviceBackend {
             }
             MTLBuiltinPipelines.init(
                     this.metalDevice,
-                    selectedResidencySet,
+                    this.metal4CommandPath ? selectedResidencySet : null,
                     selectedCompiler,
                     selectedArchive
             );

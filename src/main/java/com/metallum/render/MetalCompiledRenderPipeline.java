@@ -192,7 +192,11 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
                     }
                 } catch (Throwable throwable) {
                     if (!ObjC.isNil(withDepth)) {
-                        device.releaseAllocationNow(withDepth);
+                        if (device.usesMetal4CommandPath()) {
+                            device.releaseAllocationNow(withDepth);
+                        } else {
+                            ObjC.release(withDepth);
+                        }
                     }
                     throw throwable;
                 }
@@ -322,7 +326,7 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
             MemorySegment pipeline = device.metalDevice().newRenderPipelineStateAsync(pipelineDesc);
             if (ObjC.isNil(pipeline)) {
                 Metallum.LOGGER.error("[metallum] Pipeline {} failed to build with depth format {}", info.getLocation(), depthFormat);
-            } else if (device.usesExplicitResidency()) {
+            } else if (device.usesMetal4CommandPath()) {
                 try {
                     device.trackAllocation(pipeline);
                 } catch (RuntimeException exception) {
@@ -481,7 +485,7 @@ final class MetalCompiledRenderPipeline implements CompiledRenderPipeline, AutoC
     }
 
     private void releasePipeline(final MemorySegment pipeline) {
-        if (this.device.usesExplicitResidency()) {
+        if (this.device.usesMetal4CommandPath()) {
             this.device.queueAllocationRelease(pipeline);
         } else {
             this.device.queueResourceRelease(pipeline);
