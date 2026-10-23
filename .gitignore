@@ -40,3 +40,6 @@ replay_*.log
 *.jfr
 /src/main/resources/natives/macos/*
 libs/
+
+# beeps agent skill, kept local
+.claude/skills/beeps/
