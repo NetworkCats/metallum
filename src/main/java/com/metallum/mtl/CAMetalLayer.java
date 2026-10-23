@@ -12,12 +12,10 @@ import static java.lang.foreign.ValueLayout.*;
 
 @Environment(EnvType.CLIENT)
 public final class CAMetalLayer implements AutoCloseable {
-    private static final MemorySegment CLS = ObjC.clazz("CAMetalLayer");
-    private static final Msg NEW = Msg.of("new", ADDRESS);
     private static final Msg SET_DEVICE = Msg.ofVoid("setDevice:", ADDRESS);
     private static final Msg SET_FRAMEBUFFER_ONLY = Msg.ofVoid("setFramebufferOnly:", JAVA_BOOLEAN);
     private static final Msg SET_OPAQUE = Msg.ofVoid("setOpaque:", JAVA_BOOLEAN);
-    private static final Msg SET_CONTENTS_SCALE = Msg.ofVoid("setContentsScale:", JAVA_DOUBLE);
+    private static final Msg SET_COLORSPACE = Msg.ofVoid("setColorspace:", ADDRESS);
     private static final Msg SET_PIXEL_FORMAT = Msg.ofVoid("setPixelFormat:", JAVA_LONG);
     private static final Msg SET_DRAWABLE_SIZE = Msg.ofVoid("setDrawableSize:", JAVA_DOUBLE, JAVA_DOUBLE);
     private static final Msg SET_ALLOWS_NEXT_DRAWABLE_TIMEOUT = Msg.ofVoid("setAllowsNextDrawableTimeout:", JAVA_BOOLEAN);
@@ -27,21 +25,32 @@ public final class CAMetalLayer implements AutoCloseable {
 
     private MemorySegment handle;
 
-    public CAMetalLayer(final MTLDevice device, final double contentsScale) {
-        MemorySegment created = NEW.sendPtr(CLS);
-        if (ObjC.isNil(created)) {
-            throw new IllegalStateException("Failed to create CAMetalLayer");
+    /**
+     * Adopts an existing layer (for example the one backing an SDL Metal view) and configures it
+     * for presentation. The layer is retained until {@link #close()}.
+     */
+    public CAMetalLayer(final MemorySegment layer, final MTLDevice device, final boolean displayP3) {
+        if (ObjC.isNil(layer)) {
+            throw new IllegalStateException("CAMetalLayer handle is nil");
         }
+        MemorySegment retained = ObjC.retain(layer);
         try {
-            SET_DEVICE.send(created, device.handle());
-            SET_FRAMEBUFFER_ONLY.send(created, true);
-            SET_OPAQUE.send(created, true);
-            SET_CONTENTS_SCALE.send(created, contentsScale);
+            SET_DEVICE.send(retained, device.handle());
+            // Upstream's fix for the ~700 FPS presentation cap (kokodio/metallum#11).
+            SET_FRAMEBUFFER_ONLY.send(retained, false);
+            SET_OPAQUE.send(retained, true);
+            MemorySegment colorspace = CGColorSpace.createWithName(
+                    displayP3 ? CGColorSpace.DISPLAY_P3 : CGColorSpace.SRGB);
+            try {
+                SET_COLORSPACE.send(retained, colorspace);
+            } finally {
+                CGColorSpace.release(colorspace);
+            }
         } catch (Throwable throwable) {
-            ObjC.release(created);
+            ObjC.release(retained);
             throw throwable;
         }
-        this.handle = created;
+        this.handle = retained;
     }
 
     public MemorySegment handle() {

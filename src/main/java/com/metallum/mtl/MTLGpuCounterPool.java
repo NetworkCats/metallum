@@ -10,43 +10,28 @@ import org.jspecify.annotations.Nullable;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemorySegment;
-import java.util.Locale;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
-import static java.lang.foreign.ValueLayout.JAVA_BOOLEAN;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
-/** A timestamp counter heap/sample buffer selected at runtime. */
+/** A Metal 4 timestamp counter heap. */
 @Environment(EnvType.CLIENT)
 public final class MTLGpuCounterPool implements AutoCloseable {
     private static final MemoryLayout NS_RANGE = MemoryLayout.structLayout(JAVA_LONG, JAVA_LONG);
     private static final MemorySegment MTL4_DESCRIPTOR_CLASS = ObjC.findClass("MTL4CounterHeapDescriptor");
-    private static final MemorySegment MTL3_DESCRIPTOR_CLASS = ObjC.findClass("MTLCounterSampleBufferDescriptor");
     private static final Msg NEW = Msg.of("new", ADDRESS);
     private static final Msg SET_TYPE = Msg.ofVoid("setType:", JAVA_LONG);
     private static final Msg SET_COUNT = Msg.ofVoid("setCount:", JAVA_LONG);
     private static final Msg NEW_COUNTER_HEAP = Msg.of(
             "newCounterHeapWithDescriptor:error:", ADDRESS, ADDRESS, ADDRESS);
-    private static final Msg COUNTER_SETS = Msg.of("counterSets", ADDRESS);
-    private static final Msg ARRAY_COUNT = Msg.of("count", JAVA_LONG);
-    private static final Msg OBJECT_AT_INDEX = Msg.of("objectAtIndex:", ADDRESS, JAVA_LONG);
-    private static final Msg NAME = Msg.of("name", ADDRESS);
-    private static final Msg SET_COUNTER_SET = Msg.ofVoid("setCounterSet:", ADDRESS);
-    private static final Msg SET_STORAGE_MODE = Msg.ofVoid("setStorageMode:", JAVA_LONG);
-    private static final Msg SET_SAMPLE_COUNT = Msg.ofVoid("setSampleCount:", JAVA_LONG);
-    private static final Msg NEW_SAMPLE_BUFFER = Msg.of(
-            "newCounterSampleBufferWithDescriptor:error:", ADDRESS, ADDRESS, ADDRESS);
     private static final Msg RESOLVE = Msg.of("resolveCounterRange:", ADDRESS, NS_RANGE);
     private static final Msg DATA_BYTES = Msg.of("bytes", ADDRESS);
     private static final Msg DATA_LENGTH = Msg.of("length", JAVA_LONG);
     private static final Msg SAMPLE_TIMESTAMPS = Msg.ofVoid(
             "sampleTimestamps:gpuTimestamp:", ADDRESS, ADDRESS);
     private static final Msg QUERY_TIMESTAMP_FREQUENCY = Msg.of("queryTimestampFrequency", JAVA_LONG);
-    private static final Msg SUPPORTS_COUNTER_SAMPLING =
-            Msg.of("supportsCounterSampling:", JAVA_BOOLEAN, JAVA_LONG);
 
     private final MTLDevice device;
-    private final boolean metal4;
     private final long frequency;
     private final long initialCpuTimestamp;
     private final long initialGpuTimestamp;
@@ -55,33 +40,31 @@ public final class MTLGpuCounterPool implements AutoCloseable {
     private MTLGpuCounterPool(
             final MTLDevice device,
             final MemorySegment handle,
-            final boolean metal4,
             final long frequency,
             final long initialCpuTimestamp,
             final long initialGpuTimestamp
     ) {
         this.device = device;
         this.handle = handle;
-        this.metal4 = metal4;
         this.frequency = frequency;
         this.initialCpuTimestamp = initialCpuTimestamp;
         this.initialGpuTimestamp = initialGpuTimestamp;
     }
 
     @Nullable
-    public static MTLGpuCounterPool create(final MTLDevice device, final int size, final boolean metal4) {
+    public static MTLGpuCounterPool create(final MTLDevice device, final int size) {
         if (size <= 0) {
             throw new IllegalArgumentException("Timestamp query pool size must be positive");
         }
         try {
-            return metal4 ? createMetal4(device, size) : createMetal3(device, size);
+            return createHeap(device, size);
         } catch (RuntimeException ignored) {
             return null;
         }
     }
 
     @Nullable
-    private static MTLGpuCounterPool createMetal4(final MTLDevice device, final int size) {
+    private static MTLGpuCounterPool createHeap(final MTLDevice device, final int size) {
         if (ObjC.isNil(MTL4_DESCRIPTOR_CLASS)
                 || !ObjC.respondsToSelector(device.handle(), "newCounterHeapWithDescriptor:error:")
                 || !ObjC.respondsToSelector(device.handle(), "queryTimestampFrequency")) {
@@ -104,7 +87,7 @@ public final class MTLGpuCounterPool implements AutoCloseable {
                     long frequency = QUERY_TIMESTAMP_FREQUENCY.sendLong(device.handle());
                     long[] timestamps = sampleClockPair(device.handle());
                     return new MTLGpuCounterPool(
-                            device, heap, true, frequency, timestamps[0], timestamps[1]);
+                            device, heap, frequency, timestamps[0], timestamps[1]);
                 } catch (RuntimeException exception) {
                     ObjC.release(heap);
                     throw exception;
@@ -113,52 +96,6 @@ public final class MTLGpuCounterPool implements AutoCloseable {
                 ObjC.release(descriptor);
             }
         }
-    }
-
-    @Nullable
-    private static MTLGpuCounterPool createMetal3(final MTLDevice device, final int size) {
-        if (ObjC.isNil(MTL3_DESCRIPTOR_CLASS)
-                || !ObjC.respondsToSelector(device.handle(), "counterSets")
-                || !ObjC.respondsToSelector(device.handle(), "newCounterSampleBufferWithDescriptor:error:")
-                || !ObjC.respondsToSelector(device.handle(), "supportsCounterSampling:")
-                || !SUPPORTS_COUNTER_SAMPLING.sendBoolean(device.handle(), 1L)
-                || !SUPPORTS_COUNTER_SAMPLING.sendBoolean(device.handle(), 4L)) {
-            return null;
-        }
-        try (AutoreleasePool ignored = AutoreleasePool.push(); Arena arena = Arena.ofConfined()) {
-            MemorySegment timestampSet = findTimestampCounterSet(device.handle());
-            if (ObjC.isNil(timestampSet)) {
-                return null;
-            }
-            MemorySegment descriptor = NEW.sendPtr(MTL3_DESCRIPTOR_CLASS);
-            if (ObjC.isNil(descriptor)) {
-                return null;
-            }
-            try {
-                SET_COUNTER_SET.send(descriptor, timestampSet);
-                SET_STORAGE_MODE.send(descriptor, MTLStorageMode.Shared.value);
-                SET_SAMPLE_COUNT.send(descriptor, size);
-                MemorySegment sampleBuffer = NEW_SAMPLE_BUFFER.sendPtr(
-                        device.handle(), descriptor, arena.allocate(ADDRESS));
-                if (ObjC.isNil(sampleBuffer)) {
-                    return null;
-                }
-                try {
-                    long[] timestamps = sampleClockPair(device.handle());
-                    return new MTLGpuCounterPool(
-                            device, sampleBuffer, false, 0L, timestamps[0], timestamps[1]);
-                } catch (RuntimeException exception) {
-                    ObjC.release(sampleBuffer);
-                    throw exception;
-                }
-            } finally {
-                ObjC.release(descriptor);
-            }
-        }
-    }
-
-    public boolean isMetal4() {
-        return this.metal4;
     }
 
     public MemorySegment handle() {
@@ -186,59 +123,26 @@ public final class MTLGpuCounterPool implements AutoCloseable {
                 return false;
             }
             MemorySegment values = bytes.reinterpret((long) count * Long.BYTES);
-            long[] finalPair = this.metal4 ? null : sampleClockPair(this.device.handle());
             boolean resolvedAny = false;
             for (int i = 0; i < count; i++) {
                 long raw = values.get(JAVA_LONG, (long) i * Long.BYTES);
                 if (raw == 0L || raw == -1L) {
                     continue;
                 }
-                destination[index + i] = toNanoseconds(raw, finalPair);
+                destination[index + i] = toNanoseconds(raw);
                 resolvedAny = true;
             }
             return resolvedAny;
         }
     }
 
-    private long toNanoseconds(final long raw, @Nullable final long[] finalPair) {
-        if (this.metal4) {
-            if (this.frequency <= 0L || this.initialCpuTimestamp == 0L) {
-                return raw;
-            }
-            return this.initialCpuTimestamp + Math.round(
-                    (double) (raw - this.initialGpuTimestamp)
-                            * 1_000_000_000.0 / (double) this.frequency);
-        }
-        if (finalPair == null) {
-            return raw;
-        }
-        long gpuSpan = finalPair[1] - this.initialGpuTimestamp;
-        long cpuSpan = finalPair[0] - this.initialCpuTimestamp;
-        if (gpuSpan <= 0L || cpuSpan <= 0L) {
+    private long toNanoseconds(final long raw) {
+        if (this.frequency <= 0L || this.initialCpuTimestamp == 0L) {
             return raw;
         }
         return this.initialCpuTimestamp + Math.round(
-                (double) (raw - this.initialGpuTimestamp) * (double) cpuSpan / (double) gpuSpan);
-    }
-
-    private static MemorySegment findTimestampCounterSet(final MemorySegment device) {
-        MemorySegment sets = COUNTER_SETS.sendPtr(device);
-        if (ObjC.isNil(sets)) {
-            return MemorySegment.NULL;
-        }
-        long count = ARRAY_COUNT.sendLong(sets);
-        for (long i = 0L; i < count; i++) {
-            MemorySegment set = OBJECT_AT_INDEX.sendPtr(sets, i);
-            if (ObjC.isNil(set)) {
-                continue;
-            }
-            MemorySegment name = NAME.sendPtr(set);
-            if (!ObjC.isNil(name)
-                    && ObjC.javaString(name).toLowerCase(Locale.ROOT).contains("timestamp")) {
-                return set;
-            }
-        }
-        return MemorySegment.NULL;
+                (double) (raw - this.initialGpuTimestamp)
+                        * 1_000_000_000.0 / (double) this.frequency);
     }
 
     private static long[] sampleClockPair(final MemorySegment device) {

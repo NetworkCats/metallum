@@ -70,6 +70,14 @@ public record Msg(String name, MemorySegment sel, MethodHandle handle) {
         }
     }
 
+    public void send(MemorySegment self, long a, long b, long c) {
+        try {
+            handle.invokeExact(self, sel, a, b, c);
+        } catch (Throwable throwable) {
+            throw fail(throwable);
+        }
+    }
+
     public void send(MemorySegment self, float a, float b, float c) {
         try {
             handle.invokeExact(self, sel, a, b, c);

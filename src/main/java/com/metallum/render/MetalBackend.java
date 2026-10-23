@@ -1,23 +1,18 @@
 package com.metallum.render;
 
 import com.metallum.Metallum;
-import com.metallum.mtl.CAMetalLayer;
 import com.metallum.mtl.MTLDevice;
-import com.metallum.objc.Cocoa;
 import com.metallum.objc.ObjC;
-import com.mojang.blaze3d.GLFWErrorCapture;
-import com.mojang.blaze3d.shaders.GpuDebugOptions;
-import com.mojang.blaze3d.shaders.ShaderSource;
-import com.mojang.blaze3d.systems.BackendCreationException;
-import com.mojang.blaze3d.systems.GpuBackend;
-import com.mojang.blaze3d.systems.GpuDevice;
+import com.mojang.renderpearl.api.device.BackendCreationException;
+import com.mojang.renderpearl.api.device.GpuBackend;
+import com.mojang.renderpearl.api.device.GpuDebugOptions;
+import com.mojang.renderpearl.api.device.GpuDevice;
+import com.mojang.renderpearl.frontend.FrontendGpuDevice;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import org.jspecify.annotations.NonNull;
-import org.lwjgl.glfw.GLFW;
-import org.lwjgl.glfw.GLFWNativeCocoa;
-
-import java.lang.foreign.MemorySegment;
+import org.jspecify.annotations.Nullable;
+import org.lwjgl.sdl.SDLVideo;
 
 @Environment(EnvType.CLIENT)
 public class MetalBackend implements GpuBackend {
@@ -27,84 +22,67 @@ public class MetalBackend implements GpuBackend {
     }
 
     @Override
-    public void setWindowHints() {
-        GLFW.glfwWindowHint(GLFW.GLFW_CLIENT_API, GLFW.GLFW_NO_API);
+    public void loadLibrary() throws BackendCreationException {
+        if (!System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("mac")) {
+            throw new BackendCreationException("Metal is only available on macOS", BackendCreationException.Reason.PLATFORM_ERROR);
+        }
     }
 
     @Override
-    public void handleWindowCreationErrors(final GLFWErrorCapture.Error error) throws BackendCreationException {
-        throw new BackendCreationException(error.toString(), BackendCreationException.Reason.GLFW_ERROR);
+    public void unloadLibrary() {
     }
 
     @Override
-    public @NonNull GpuDevice createDevice(
-            final long window, final @NonNull ShaderSource defaultShaderSource, final @NonNull GpuDebugOptions debugOptions, final @NonNull Runnable criticalShaderLoader
-    ) throws BackendCreationException {
+    public long createWindow(@Nullable final String title, final int width, final int height, final long flags) {
+        return SDLVideo.SDL_CreateWindow(title, width, height, SDLVideo.SDL_WINDOW_METAL | flags);
+    }
+
+    @Override
+    public @NonNull GpuDevice createDevice(final @NonNull GpuDebugOptions debugOptions) throws BackendCreationException {
         MTLDevice metalDevice = MTLDevice.createSystemDefault();
         if (metalDevice == null) {
-            throw new BackendCreationException("MTLCreateSystemDefaultDevice returned null", BackendCreationException.Reason.OTHER);
+            throw new BackendCreationException("MTLCreateSystemDefaultDevice returned null", BackendCreationException.Reason.PLATFORM_ERROR);
         }
 
-        Cocoa cocoa;
         String deviceName;
         try {
             deviceName = metalDevice.name();
             if (deviceName.isBlank()) deviceName = "<unknown Metal device>";
-            cocoa = new Cocoa(
-                    MemorySegment.ofAddress(GLFWNativeCocoa.glfwGetCocoaWindow(window)),
-                    MemorySegment.ofAddress(GLFWNativeCocoa.glfwGetCocoaView(window))
-            );
+            if (!metalDevice.supportsMetal4()) {
+                ObjC.release(metalDevice.handle());
+                throw new BackendCreationException(
+                        "Metallum requires Metal 4 (macOS 26 or newer on Apple silicon); " + deviceName + " does not support it",
+                        BackendCreationException.Reason.PLATFORM_ERROR);
+            }
+        } catch (BackendCreationException exception) {
+            throw exception;
         } catch (Throwable throwable) {
             ObjC.release(metalDevice.handle());
-            throw new BackendCreationException(errorMessage(throwable), BackendCreationException.Reason.GLFW_ERROR);
+            throw new BackendCreationException(errorMessage(throwable), BackendCreationException.Reason.PLATFORM_ERROR);
         }
 
-        CAMetalLayer metalLayer;
+        Metallum.LOGGER.info("Metal device: {}", deviceName);
+        MetalDevice backend;
         try {
-            metalLayer = new CAMetalLayer(metalDevice, cocoa.backingScaleFactor());
+            backend = new MetalDevice(debugOptions, metalDevice.handle(), deviceName);
         } catch (Throwable throwable) {
             ObjC.release(metalDevice.handle());
-            throw new BackendCreationException(errorMessage(throwable), BackendCreationException.Reason.OTHER);
+            throw new BackendCreationException(
+                    "Metal device initialization failed: " + errorMessage(throwable),
+                    BackendCreationException.Reason.OTHER);
         }
 
-        MetalDevice backend = null;
-        boolean layerAttached = false;
         try {
-            layerAttached = true;
-            cocoa.setViewLayer(metalLayer.handle());
-            Metallum.LOGGER.info("Metal device: {}", deviceName);
-
-            backend = new MetalDevice(defaultShaderSource, debugOptions, metalDevice.handle(), metalLayer, deviceName, cocoa);
             Metallum.LOGGER.info(
-                    "Metal command path: {}; Metal 4 available: {}; Metal 4 compiler: {}; explicit residency: {}; concurrent compilation: {}",
-                    backend.usesMetal4CommandPath() ? "Metal 4" : "Metal 3",
-                    backend.metal4Available(),
-                    backend.usesMetal4Compiler(),
-                    backend.usesExplicitResidency(),
+                    "Metal 4 command path; concurrent compilation: {}",
                     backend.concurrentCompilationEnabled()
             );
-            return new GpuDevice(backend, criticalShaderLoader);
+            return new FrontendGpuDevice(backend);
         } catch (Throwable throwable) {
-            if (backend != null) {
-                try {
-                    backend.close();
-                } catch (Throwable closeFailure) {
-                    throwable.addSuppressed(closeFailure);
-                }
-            } else {
-                if (layerAttached) {
-                    try {
-                        cocoa.clearViewLayer();
-                    } catch (Throwable cleanupFailure) {
-                        throwable.addSuppressed(cleanupFailure);
-                    }
-                }
-                try {
-                    metalLayer.close();
-                } catch (Throwable cleanupFailure) {
-                    throwable.addSuppressed(cleanupFailure);
-                }
-                ObjC.release(metalDevice.handle());
+            try {
+                backend.close();
+            } catch (Throwable closeFailure) {
+                throwable.addSuppressed(closeFailure);
             }
             throw new BackendCreationException(
                     "Metal device initialization failed: " + errorMessage(throwable),

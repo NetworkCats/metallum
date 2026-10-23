@@ -1,16 +1,12 @@
 package com.metallum.render;
 
-import com.mojang.blaze3d.GpuFormat;
-import com.mojang.blaze3d.pipeline.BindGroupLayout;
-import com.mojang.blaze3d.pipeline.BindGroupLayout.UniformDescription;
-import com.mojang.blaze3d.pipeline.RenderPipeline;
-import com.mojang.blaze3d.shaders.ShaderSource;
-import com.mojang.blaze3d.shaders.ShaderType;
-import com.mojang.blaze3d.vertex.VertexFormat;
-import com.mojang.blaze3d.vertex.VertexFormatElement;
-import com.mojang.blaze3d.vulkan.VulkanBindGroupLayout;
-import com.mojang.blaze3d.vulkan.VulkanBindGroupLayout.VulkanBindGroupEntryType;
-import com.mojang.blaze3d.vulkan.glsl.*;
+import com.mojang.renderpearl.api.GpuFormat;
+import com.mojang.renderpearl.api.pipeline.BindGroupLayout.UniformDescription;
+import com.mojang.renderpearl.api.pipeline.ShaderType;
+import com.mojang.renderpearl.api.pipeline.UniformType;
+import com.mojang.renderpearl.backend.api.BackendRenderPipeline;
+import com.mojang.renderpearl.backend.api.SpvModule;
+import com.mojang.renderpearl.util.ShaderCompileException;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import org.jspecify.annotations.Nullable;
@@ -19,6 +15,7 @@ import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.util.spvc.Spv;
 import org.lwjgl.util.spvc.Spvc;
+import org.lwjgl.util.spvc.SpvcMslResourceBinding;
 import org.lwjgl.util.spvc.SpvcMslShaderInterfaceVar2;
 import org.lwjgl.util.spvc.SpvcReflectedResource;
 
@@ -28,156 +25,75 @@ import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+/**
+ * Translates the frontend's reflected SPIR-V into MSL. The frontend has already assigned every
+ * uniform a binding equal to its index in {@link BackendRenderPipeline.CreateInfo#uniforms()};
+ * this class maps those onto Metal's separate buffer, texture and sampler argument namespaces.
+ */
 @Environment(EnvType.CLIENT)
 final class MetalCrossShaderCompiler {
-    private static final Set<String> BUILT_IN_UNIFORMS = Set.of("Projection", "Lighting", "Fog", "Globals");
     // SPIRV-Cross encodes MSL versions as major * 10000 + minor * 100 + patch.
-    private static final int MSL_VERSION_3_0 = 30_000;
-    private static final int MSL_VERSION_4_0 = 40_000;
+    static final int MSL_VERSION = 40_000;
+    static final String MSL_VERSION_NAME = "4.0";
+    private static final int[] RESOURCE_TYPES = {
+            Spvc.SPVC_RESOURCE_TYPE_UNIFORM_BUFFER,
+            Spvc.SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
+            Spvc.SPVC_RESOURCE_TYPE_SEPARATE_IMAGE,
+            Spvc.SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS
+    };
     private static final Pattern VERTEX_ENTRY_PATTERN = Pattern.compile("\\bvertex\\s+\\w+\\s+(\\w+)\\s*\\(");
     private static final Pattern FRAGMENT_ENTRY_PATTERN = Pattern.compile("\\bfragment\\s+\\w+\\s+(\\w+)\\s*\\(");
 
     private MetalCrossShaderCompiler() {
     }
 
-    static MetalCompiledRenderPipeline compile(final MetalDevice device, final RenderPipeline pipeline, final ShaderSource shaderSource) {
-        try {
-            CachedShaderModule cachedVertex = device.getOrCompileShader(pipeline.getVertexShader(), ShaderType.VERTEX, pipeline.getShaderDefines(), shaderSource);
-            CachedShaderModule cachedFragment = device.getOrCompileShader(pipeline.getFragmentShader(), ShaderType.FRAGMENT, pipeline.getShaderDefines(), shaderSource);
-            if (!cachedVertex.isValid() || !cachedFragment.isValid()) {
-                throw new IllegalStateException(
-                        "Couldn't compile shader for pipeline " + pipeline.getLocation()
-                );
-            }
-
-            try (IntermediaryShaderModule vertexSpirv = cachedVertex.instantiate();
-                 IntermediaryShaderModule fragmentSpirv = cachedFragment.instantiate()) {
-
-                List<VulkanBindGroupLayout.Entry> layoutEntries = new ArrayList<>();
-                addToBindGroup(layoutEntries, vertexSpirv, pipeline);
-                addToBindGroup(layoutEntries, fragmentSpirv, pipeline);
-                List<String> vertexOutputs = extractVariableNames(vertexSpirv.outputs());
-
-                vertexSpirv.rebind(tolerateUnprovidedInputs(MetalPipelineSupport.vertexAttributeNames(pipeline), vertexSpirv.inputs()), layoutEntries);
-                int mslVersion = device.usesMetal4CommandPath() ? MSL_VERSION_4_0 : MSL_VERSION_3_0;
-                MslShader vertexMsl = spirvToMsl(
-                        vertexSpirv.spirv(),
-                        layoutEntries.size(),
-                        vertexAttributeFormats(pipeline),
-                        true,
-                        mslVersion
-                );
-
-                boolean enableFragDepth = pipeline.getDepthStencilState() != null;
-                fragmentSpirv.rebind(tolerateUnprovidedInputs(vertexOutputs, fragmentSpirv.inputs()), layoutEntries);
-                MslShader fragmentMsl = spirvToMsl(
-                        fragmentSpirv.spirv(),
-                        layoutEntries.size(),
-                        Map.of(),
-                        enableFragDepth,
-                        mslVersion
-                );
-
-                String vertexEntryPoint = extractEntryPoint(vertexMsl.source(), VERTEX_ENTRY_PATTERN, "main0");
-                String fragmentEntryPoint = extractEntryPoint(fragmentMsl.source(), FRAGMENT_ENTRY_PATTERN, "main0");
-                List<MetalCompiledRenderPipeline.ResourceBinding> resources = buildResourceBindings(layoutEntries, vertexMsl, fragmentMsl);
-                return new MetalCompiledRenderPipeline(
-                        device,
-                        pipeline,
-                        vertexMsl.source(),
-                        fragmentMsl.source(),
-                        vertexEntryPoint,
-                        fragmentEntryPoint,
-                        resources
-                );
-            }
-        } catch (ShaderCompileException e) {
-            throw new IllegalStateException("Failed to compile Metal cross shader for pipeline " + pipeline.getLocation(), e);
-        }
-    }
-
-    private static void addToBindGroup(
-            final List<VulkanBindGroupLayout.Entry> entries,
-            final IntermediaryShaderModule shader,
-            final RenderPipeline pipeline
-    ) throws ShaderCompileException {
-        List<UniformDescription> uniforms = BindGroupLayout.flattenUniforms(pipeline.getBindGroupLayouts());
-        List<String> samplers = BindGroupLayout.flattenSamplers(pipeline.getBindGroupLayouts());
-        for (SpvUniformBuffer buffer : shader.uniformBuffers()) {
-            String name = buffer.name();
-            if (findUniform(uniforms, name) == null && !BUILT_IN_UNIFORMS.contains(name)) {
-                throw new ShaderCompileException("Unable to find shader defined uniform (" + name + ")");
-            }
-            addBindingIfAbsent(entries, VulkanBindGroupEntryType.UNIFORM_BUFFER, name, null);
-        }
-
-        for (SpvSampler sampler : shader.samplers()) {
-            String name = sampler.name();
-            UniformDescription uniform = findUniform(uniforms, name);
-            int dimensions = sampler.dimensions();
-            if (uniform != null) {
-                if (dimensions != Spv.SpvDimBuffer) {
-                    throw new ShaderCompileException("UTB (" + name + ") must have type of SpvDimBuffer");
-                }
-                addBindingIfAbsent(entries, VulkanBindGroupEntryType.TEXEL_BUFFER, name, uniform.gpuFormat());
-            } else {
-                if (!samplers.contains(name)) {
-                    throw new ShaderCompileException("Unable to find shader defined uniform (" + name + ")");
-                }
-                if (dimensions != Spv.SpvDim2D && dimensions != Spv.SpvDimCube) {
-                    throw new ShaderCompileException("Sampled texture (" + name + ") must have type of SpvDim2D or SpvDimCube");
-                }
-                addBindingIfAbsent(entries, VulkanBindGroupEntryType.SAMPLED_IMAGE, name, null);
-            }
-        }
-    }
-
-    @Nullable
-    private static UniformDescription findUniform(final List<UniformDescription> uniforms, final String name) {
-        for (UniformDescription uniform : uniforms) {
-            if (uniform.name().equals(name)) {
-                return uniform;
-            }
-        }
-        return null;
-    }
-
-    private static void addBindingIfAbsent(
-            final List<VulkanBindGroupLayout.Entry> entries,
-            final VulkanBindGroupEntryType type,
-            final String name,
-            @Nullable final GpuFormat texelBufferFormat
+    record Compiled(
+            String vertexSource,
+            String fragmentSource,
+            String vertexEntryPoint,
+            String fragmentEntryPoint,
+            List<MetalCompiledRenderPipeline.ResourceBinding> resources,
+            MetalCompiledRenderPipeline.@Nullable PushConstants pushConstants,
+            int firstVertexBufferSlot
     ) {
-        for (VulkanBindGroupLayout.Entry entry : entries) {
-            if (entry.type() == type && entry.name().equals(name)) {
-                return;
-            }
-        }
-        entries.add(new VulkanBindGroupLayout.Entry(type, name, texelBufferFormat));
     }
 
-    private static List<String> tolerateUnprovidedInputs(final List<String> provided, final List<SpvVariable> shaderInputs) {
-        List<String> result = null;
-        for (SpvVariable input : shaderInputs) {
-            String name = input.name();
-            if (!provided.contains(name)) {
-                if (result == null) {
-                    result = new ArrayList<>(provided);
-                }
-                if (!result.contains(name)) {
-                    result.add(name);
-                }
+    static Compiled compile(final BackendRenderPipeline.CreateInfo info) throws ShaderCompileException {
+        SpvModule vertexSpirv = null;
+        SpvModule fragmentSpirv = null;
+        for (BackendRenderPipeline.CreateInfo.Shader shader : info.shaders()) {
+            if (shader.module().type() == ShaderType.VERTEX) {
+                vertexSpirv = shader.module();
+            } else if (shader.module().type() == ShaderType.FRAGMENT) {
+                fragmentSpirv = shader.module();
             }
         }
-        return result == null ? provided : result;
-    }
-
-    private static List<String> extractVariableNames(final List<SpvVariable> variables) {
-        List<String> names = new ArrayList<>(variables.size());
-        for (SpvVariable variable : variables) {
-            names.add(variable.name());
+        if (vertexSpirv == null || fragmentSpirv == null) {
+            throw new ShaderCompileException("Pipeline " + info.name() + " requires both a vertex and a fragment shader");
         }
-        return names;
+
+        List<UniformDescription> uniforms = info.uniforms();
+        MetalIndices metalIndices = MetalIndices.of(uniforms);
+
+        MslShader vertexMsl = spirvToMsl(vertexSpirv.spv(), metalIndices, vertexAttributeFormats(info), true);
+        boolean enableFragDepth = info.depthStencilState() != null;
+        MslShader fragmentMsl = spirvToMsl(fragmentSpirv.spv(), metalIndices, Map.of(), enableFragDepth);
+
+        String vertexEntryPoint = extractEntryPoint(vertexMsl.source(), VERTEX_ENTRY_PATTERN, "main0");
+        String fragmentEntryPoint = extractEntryPoint(fragmentMsl.source(), FRAGMENT_ENTRY_PATTERN, "main0");
+        List<MetalCompiledRenderPipeline.ResourceBinding> resources =
+                buildResourceBindings(uniforms, metalIndices, vertexMsl, fragmentMsl);
+        MetalCompiledRenderPipeline.PushConstants pushConstants = buildPushConstants(metalIndices, vertexMsl, fragmentMsl);
+        int firstVertexBufferSlot = metalIndices.pushConstants() + 1;
+        return new Compiled(
+                vertexMsl.source(),
+                fragmentMsl.source(),
+                vertexEntryPoint,
+                fragmentEntryPoint,
+                resources,
+                pushConstants,
+                firstVertexBufferSlot
+        );
     }
 
     private static String extractEntryPoint(final String msl, final Pattern pattern, final String fallback) {
@@ -186,34 +102,40 @@ final class MetalCrossShaderCompiler {
     }
 
     private static List<MetalCompiledRenderPipeline.ResourceBinding> buildResourceBindings(
-            final List<VulkanBindGroupLayout.Entry> entries,
+            final List<UniformDescription> uniforms,
+            final MetalIndices metalIndices,
             final MslShader vertexMsl,
             final MslShader fragmentMsl
     ) {
-        List<MetalCompiledRenderPipeline.ResourceBinding> resources = new ArrayList<>(entries.size() + 1);
-        for (int index = 0; index < entries.size(); index++) {
-            VulkanBindGroupLayout.Entry entry = entries.get(index);
-            MetalCompiledRenderPipeline.ResourceKind kind = switch (entry.type()) {
+        List<MetalCompiledRenderPipeline.ResourceBinding> resources = new ArrayList<>(uniforms.size());
+        for (int index = 0; index < uniforms.size(); index++) {
+            UniformDescription uniform = uniforms.get(index);
+            MetalCompiledRenderPipeline.ResourceKind kind = switch (uniform.type()) {
                 case UNIFORM_BUFFER -> MetalCompiledRenderPipeline.ResourceKind.UNIFORM_BUFFER;
-                case SAMPLED_IMAGE -> MetalCompiledRenderPipeline.ResourceKind.SAMPLED_IMAGE;
+                case COMBINED_IMAGE_SAMPLER -> MetalCompiledRenderPipeline.ResourceKind.SAMPLED_IMAGE;
                 case TEXEL_BUFFER -> MetalCompiledRenderPipeline.ResourceKind.TEXEL_BUFFER;
             };
-            GpuFormat texelFormat = entry.type() == VulkanBindGroupLayout.VulkanBindGroupEntryType.TEXEL_BUFFER ? entry.texelBufferFormat() : null;
-            resources.add(new MetalCompiledRenderPipeline.ResourceBinding(kind, entry.name(), index, stageMask(entry.name(), vertexMsl, fragmentMsl), texelFormat));
-        }
-
-        int pushConstantStageMask = (vertexMsl.hasPushConstants() ? MetalCompiledRenderPipeline.STAGE_VERTEX : 0)
-                | (fragmentMsl.hasPushConstants() ? MetalCompiledRenderPipeline.STAGE_FRAGMENT : 0);
-        if (pushConstantStageMask != 0) {
+            GpuFormat texelFormat = uniform.type() == UniformType.TEXEL_BUFFER ? uniform.gpuFormat() : null;
             resources.add(new MetalCompiledRenderPipeline.ResourceBinding(
-                    MetalCompiledRenderPipeline.ResourceKind.UNIFORM_BUFFER,
-                    "push_constants",
-                    entries.size(),
-                    pushConstantStageMask,
-                    null
+                    kind,
+                    uniform.name(),
+                    metalIndices.byBinding()[index],
+                    metalIndices.samplerByBinding()[index],
+                    stageMask(uniform.name(), vertexMsl, fragmentMsl),
+                    texelFormat
             ));
         }
         return resources;
+    }
+
+    private static MetalCompiledRenderPipeline.@Nullable PushConstants buildPushConstants(
+            final MetalIndices metalIndices,
+            final MslShader vertexMsl,
+            final MslShader fragmentMsl
+    ) {
+        int stageMask = (vertexMsl.hasPushConstants() ? MetalCompiledRenderPipeline.STAGE_VERTEX : 0)
+                | (fragmentMsl.hasPushConstants() ? MetalCompiledRenderPipeline.STAGE_FRAGMENT : 0);
+        return stageMask == 0 ? null : new MetalCompiledRenderPipeline.PushConstants(metalIndices.pushConstants(), stageMask);
     }
 
     private static int stageMask(
@@ -235,14 +157,10 @@ final class MetalCrossShaderCompiler {
         return mask;
     }
 
-    private static Map<String, GpuFormat> vertexAttributeFormats(final RenderPipeline pipeline) {
-        Map<String, GpuFormat> formats = new LinkedHashMap<>();
-        for (VertexFormat binding : pipeline.getVertexFormatBindings()) {
-            if (binding != null) {
-                for (VertexFormatElement element : binding.getElements()) {
-                    formats.putIfAbsent(element.name(), element.format());
-                }
-            }
+    private static Map<Integer, GpuFormat> vertexAttributeFormats(final BackendRenderPipeline.CreateInfo info) {
+        Map<Integer, GpuFormat> formats = new HashMap<>();
+        for (BackendRenderPipeline.CreateInfo.AttribBinding attribute : info.attribBindings()) {
+            formats.putIfAbsent(attribute.location(), attribute.format());
         }
         return formats;
     }
@@ -250,7 +168,7 @@ final class MetalCrossShaderCompiler {
     private static void registerIntegerInputConversions(
             final MemoryStack stack,
             final long compiler,
-            final Map<String, GpuFormat> attributeFormats
+            final Map<Integer, GpuFormat> attributeFormats
     ) throws ShaderCompileException {
         if (attributeFormats.isEmpty()) {
             return;
@@ -270,7 +188,8 @@ final class MetalCrossShaderCompiler {
         SpvcReflectedResource.Buffer list = SpvcReflectedResource.create(pList.get(0), count);
         for (int i = 0; i < count; i++) {
             SpvcReflectedResource input = list.get(i);
-            GpuFormat format = attributeFormats.get(input.nameString());
+            int location = Spvc.spvc_compiler_get_decoration(compiler, input.id(), Spv.SpvDecorationLocation);
+            GpuFormat format = attributeFormats.get(location);
             if (format == null || !format.name().endsWith("_UINT")) {
                 continue;
             }
@@ -289,7 +208,7 @@ final class MetalCrossShaderCompiler {
 
             SpvcMslShaderInterfaceVar2 var = SpvcMslShaderInterfaceVar2.malloc(stack);
             Spvc.spvc_msl_shader_interface_var_init_2(var);
-            var.location(Spvc.spvc_compiler_get_decoration(compiler, input.id(), Spv.SpvDecorationLocation));
+            var.location(location);
             var.vecsize(Spvc.spvc_type_get_vector_size(typeHandle));
             var.format(width);
             var.rate(Spvc.SPVC_MSL_SHADER_VARIABLE_RATE_PER_VERTEX);
@@ -306,13 +225,12 @@ final class MetalCrossShaderCompiler {
 
     private static MslShader spirvToMsl(
             final ByteBuffer spirvBytes,
-            final int pushConstantBinding,
-            final Map<String, GpuFormat> attributeFormats,
-            final boolean enableFragDepth,
-            final int mslVersion
+            final MetalIndices metalIndices,
+            final Map<Integer, GpuFormat> attributeFormats,
+            final boolean enableFragDepth
     ) throws ShaderCompileException {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            IntBuffer spirvWords = spirvBytes.asIntBuffer();
+            IntBuffer spirvWords = spirvBytes.duplicate().order(java.nio.ByteOrder.nativeOrder()).asIntBuffer();
 
             PointerBuffer pContext = stack.mallocPointer(1);
             checkSpvc(Spvc.spvc_context_create(pContext), "spvc_context_create");
@@ -336,7 +254,7 @@ final class MetalCrossShaderCompiler {
                         "spvc_compiler_options_set_uint(MSL_PLATFORM)"
                 );
                 checkSpvc(
-                        Spvc.spvc_compiler_options_set_uint(options, Spvc.SPVC_COMPILER_OPTION_MSL_VERSION, mslVersion),
+                        Spvc.spvc_compiler_options_set_uint(options, Spvc.SPVC_COMPILER_OPTION_MSL_VERSION, MSL_VERSION),
                         "spvc_compiler_options_set_uint(MSL_VERSION)"
                 );
                 checkSpvc(
@@ -360,6 +278,7 @@ final class MetalCrossShaderCompiler {
                 checkSpvc(Spvc.spvc_compiler_install_compiler_options(compiler, options), "spvc_compiler_install_compiler_options");
 
                 registerIntegerInputConversions(stack, compiler, attributeFormats);
+                remapResourceBindings(stack, compiler, metalIndices);
 
                 PointerBuffer pActiveSet = stack.mallocPointer(1);
                 checkSpvc(Spvc.spvc_compiler_get_active_interface_variables(compiler, pActiveSet), "spvc_compiler_get_active_interface_variables");
@@ -378,7 +297,7 @@ final class MetalCrossShaderCompiler {
                 boolean hasPushConstants = pCount.get(0) > 0;
                 if (hasPushConstants) {
                     SpvcReflectedResource.Buffer list = SpvcReflectedResource.create(pList.get(0), 1);
-                    Spvc.spvc_compiler_set_decoration(compiler, list.get(0).id(), Spv.SpvDecorationBinding, pushConstantBinding);
+                    Spvc.spvc_compiler_set_decoration(compiler, list.get(0).id(), Spv.SpvDecorationBinding, metalIndices.pushConstants());
                 }
 
                 PointerBuffer pSource = stack.mallocPointer(1);
@@ -387,6 +306,72 @@ final class MetalCrossShaderCompiler {
             } finally {
                 Spvc.spvc_context_destroy(context);
             }
+        }
+    }
+
+    private static void remapResourceBindings(
+            final MemoryStack stack,
+            final long compiler,
+            final MetalIndices metalIndices
+    ) throws ShaderCompileException {
+        PointerBuffer pResources = stack.mallocPointer(1);
+        checkSpvc(Spvc.spvc_compiler_create_shader_resources(compiler, pResources), "spvc_compiler_create_shader_resources");
+        int stage = Spvc.spvc_compiler_get_execution_model(compiler);
+
+        PointerBuffer pList = stack.mallocPointer(1);
+        PointerBuffer pCount = stack.mallocPointer(1);
+        for (int type : RESOURCE_TYPES) {
+            checkSpvc(Spvc.spvc_resources_get_resource_list_for_type(pResources.get(0), type, pList, pCount), "spvc_resources_get_resource_list_for_type");
+            int count = (int) pCount.get(0);
+            if (count == 0) {
+                continue;
+            }
+            SpvcReflectedResource.Buffer list = SpvcReflectedResource.create(pList.get(0), count);
+            for (int i = 0; i < count; i++) {
+                int id = list.get(i).id();
+                int binding = Spvc.spvc_compiler_get_decoration(compiler, id, Spv.SpvDecorationBinding);
+                if (binding < 0 || binding >= metalIndices.byBinding().length) {
+                    throw new ShaderCompileException("Shader resource " + list.get(i).nameString()
+                            + " uses binding " + binding + " outside the pipeline's uniform list");
+                }
+                int metalIndex = metalIndices.byBinding()[binding];
+                int samplerIndex = metalIndices.samplerByBinding()[binding];
+                SpvcMslResourceBinding resourceBinding = SpvcMslResourceBinding.malloc(stack);
+                Spvc.spvc_msl_resource_binding_init(resourceBinding);
+                resourceBinding.stage(stage)
+                        .desc_set(Spvc.spvc_compiler_get_decoration(compiler, id, Spv.SpvDecorationDescriptorSet))
+                        .binding(binding)
+                        .msl_buffer(metalIndex)
+                        .msl_texture(metalIndex)
+                        .msl_sampler(Math.max(samplerIndex, 0));
+                checkSpvc(Spvc.spvc_compiler_msl_add_resource_binding(compiler, resourceBinding), "spvc_compiler_msl_add_resource_binding");
+            }
+        }
+    }
+
+    /**
+     * Metal argument-table slots for each frontend binding. Uniform buffers count up from buffer
+     * slot 0; push constants take the next buffer slot and vertex buffers follow. Sampled images
+     * and texel buffers share the texture namespace, and only sampled images consume a sampler.
+     */
+    record MetalIndices(int[] byBinding, int[] samplerByBinding, int pushConstants) {
+        static MetalIndices of(final List<UniformDescription> uniforms) {
+            int[] byBinding = new int[uniforms.size()];
+            int[] samplers = new int[uniforms.size()];
+            int buffers = 0;
+            int textures = 0;
+            int samplerCount = 0;
+            for (int i = 0; i < byBinding.length; i++) {
+                UniformType type = uniforms.get(i).type();
+                if (type == UniformType.UNIFORM_BUFFER) {
+                    byBinding[i] = buffers++;
+                    samplers[i] = -1;
+                } else {
+                    byBinding[i] = textures++;
+                    samplers[i] = type == UniformType.COMBINED_IMAGE_SAMPLER ? samplerCount++ : -1;
+                }
+            }
+            return new MetalIndices(byBinding, samplers, buffers);
         }
     }
 

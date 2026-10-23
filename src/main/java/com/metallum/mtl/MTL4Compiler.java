@@ -4,7 +4,6 @@ import com.metallum.Metallum;
 import com.metallum.objc.AutoreleasePool;
 import com.metallum.objc.Msg;
 import com.metallum.objc.ObjC;
-import com.metallum.objc.ObjCBlock;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import org.jspecify.annotations.Nullable;
@@ -16,12 +15,10 @@ import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
 
-/** Synchronous Metal 4 compiler facade used on macOS 26 and newer. */
+/** Synchronous Metal 4 compiler facade. */
 @Environment(EnvType.CLIENT)
 public final class MTL4Compiler implements AutoCloseable {
     private static final MemorySegment COMPILER_DESCRIPTOR_CLASS = ObjC.findClass("MTL4CompilerDescriptor");
@@ -58,15 +55,6 @@ public final class MTL4Compiler implements AutoCloseable {
             ADDRESS,
             ADDRESS
     );
-    private static final Msg NEW_RENDER_PIPELINE_ASYNC = Msg.of(
-            "newRenderPipelineStateWithDescriptor:compilerTaskOptions:completionHandler:",
-            true,
-            ADDRESS,
-            ADDRESS,
-            ADDRESS,
-            ADDRESS
-    );
-    private static final Msg WAIT_UNTIL_COMPLETED = Msg.ofVoid("waitUntilCompleted", true);
     private static final Msg LOCALIZED_DESCRIPTION = Msg.of("localizedDescription", ADDRESS);
 
     private MemorySegment handle;
@@ -90,7 +78,6 @@ public final class MTL4Compiler implements AutoCloseable {
         this.archivePath = archivePath;
     }
 
-    @Nullable
     public static MTL4Compiler create(
             final MTLDevice device,
             @Nullable final String label,
@@ -99,7 +86,7 @@ public final class MTL4Compiler implements AutoCloseable {
         if (ObjC.isNil(COMPILER_DESCRIPTOR_CLASS)
                 || ObjC.isNil(LIBRARY_DESCRIPTOR_CLASS)
                 || !ObjC.respondsToSelector(device.handle(), "newCompilerWithDescriptor:error:")) {
-            return null;
+            throw new IllegalStateException("The Metal 4 compiler is unavailable on this system");
         }
         MemorySegment serializer = MemorySegment.NULL;
         MemorySegment compiler = MemorySegment.NULL;
@@ -108,7 +95,7 @@ public final class MTL4Compiler implements AutoCloseable {
         try (AutoreleasePool _ = AutoreleasePool.push(); Arena arena = Arena.ofConfined()) {
             MemorySegment descriptor = NEW.sendPtr(COMPILER_DESCRIPTOR_CLASS);
             if (ObjC.isNil(descriptor)) {
-                return null;
+                throw new IllegalStateException("Failed to create MTL4CompilerDescriptor");
             }
             try {
                 setOptionalLabel(descriptor, label);
@@ -121,8 +108,7 @@ public final class MTL4Compiler implements AutoCloseable {
                 if (ObjC.isNil(compiler)) {
                     releaseIfPresent(serializer);
                     serializer = MemorySegment.NULL;
-                    Metallum.LOGGER.error("[metallum] Failed to create MTL4Compiler: {}", errorDescription(errorOut));
-                    return null;
+                    throw new IllegalStateException("Failed to create MTL4Compiler: " + errorDescription(errorOut));
                 }
                 archive = loadArchive(device, archivePath);
                 options = createTaskOptions(archive);
@@ -136,10 +122,7 @@ public final class MTL4Compiler implements AutoCloseable {
             releaseIfPresent(archive);
             releaseIfPresent(compiler);
             releaseIfPresent(serializer);
-            Metallum.LOGGER.warn(
-                    "[metallum] Metal 4 compiler initialization failed; falling back to Metal 3",
-                    exception);
-            return null;
+            throw exception;
         }
     }
 
@@ -169,12 +152,17 @@ public final class MTL4Compiler implements AutoCloseable {
         }
     }
 
+    /**
+     * Compiles synchronously. Callers already run on Minecraft's background executor, and on
+     * macOS 27 the completion-handler variant crashes inside Metal's compiler request
+     * serialization when a pipeline data set serializer is attached.
+     */
     public MemorySegment newRenderPipelineState(final MTL4RenderPipelineDescriptor descriptor) {
-        if (ObjC.respondsToSelector(
-                handle(),
-                "newRenderPipelineStateWithDescriptor:compilerTaskOptions:completionHandler:")) {
-            return newRenderPipelineStateAsync(descriptor);
-        }
+        return newRenderPipelineState(descriptor, true);
+    }
+
+    /** As {@link #newRenderPipelineState(MTL4RenderPipelineDescriptor)}, optionally without logging failures. */
+    public MemorySegment newRenderPipelineState(final MTL4RenderPipelineDescriptor descriptor, final boolean logFailure) {
         try (AutoreleasePool _ = AutoreleasePool.push(); Arena arena = Arena.ofConfined()) {
             MemorySegment errorOut = arena.allocate(ADDRESS);
             MemorySegment pipeline = NEW_RENDER_PIPELINE.sendPtr(
@@ -184,44 +172,14 @@ public final class MTL4Compiler implements AutoCloseable {
                     errorOut
             );
             if (ObjC.isNil(pipeline)) {
-                Metallum.LOGGER.error("[metallum] Metal 4 render pipeline compilation failed: {}", errorDescription(errorOut));
+                if (logFailure) {
+                    Metallum.LOGGER.error("[metallum] Metal 4 render pipeline compilation failed: {}", errorDescription(errorOut));
+                } else {
+                    Metallum.LOGGER.debug("[metallum] Metal 4 render pipeline compilation failed: {}", errorDescription(errorOut));
+                }
                 return MemorySegment.NULL;
             }
             return pipeline;
-        }
-    }
-
-    private MemorySegment newRenderPipelineStateAsync(final MTL4RenderPipelineDescriptor descriptor) {
-        CompletableFuture<MemorySegment> completion = new CompletableFuture<>();
-        try (ObjCBlock.CompletionLease lease = ObjCBlock.leaseBiConsumer((pipeline, error) -> {
-            try (AutoreleasePool ignored = AutoreleasePool.push()) {
-                if (!ObjC.isNil(pipeline)) {
-                    completion.complete(ObjC.retain(pipeline));
-                } else {
-                    String message = ObjC.isNil(error)
-                            ? "unknown error"
-                            : ObjC.javaString(LOCALIZED_DESCRIPTION.sendPtr(error));
-                    completion.completeExceptionally(new IllegalStateException(message));
-                }
-            } catch (Throwable throwable) {
-                completion.completeExceptionally(throwable);
-            }
-        })) {
-            MemorySegment task = NEW_RENDER_PIPELINE_ASYNC.sendPtr(
-                    handle(), descriptor.handle(), ObjC.orNil(this.taskOptions), lease.block());
-            if (ObjC.isNil(task)) {
-                return MemorySegment.NULL;
-            }
-            try {
-                WAIT_UNTIL_COMPLETED.send(task);
-                return completion.join();
-            } catch (CompletionException exception) {
-                Metallum.LOGGER.error("[metallum] Metal 4 render pipeline compilation failed: {}",
-                        exception.getCause() == null ? exception.getMessage() : exception.getCause().getMessage());
-                return MemorySegment.NULL;
-            } finally {
-                ObjC.release(task);
-            }
         }
     }
 

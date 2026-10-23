@@ -5,7 +5,7 @@ import com.metallum.mtl.MTLDevice;
 import com.metallum.objc.AutoreleasePool;
 import com.metallum.objc.Msg;
 import com.metallum.objc.ObjC;
-import com.mojang.blaze3d.pipeline.RenderPipeline;
+import com.mojang.renderpearl.backend.api.BackendRenderPipeline;
 import net.fabricmc.loader.api.FabricLoader;
 
 import java.io.IOException;
@@ -17,7 +17,6 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.Locale;
 import java.util.concurrent.ConcurrentSkipListSet;
@@ -41,9 +40,9 @@ final class PipelineCacheIdentity {
         this.manifestPath = manifestPath;
     }
 
-    static PipelineCacheIdentity create(final MTLDevice device, final boolean metal4) {
-        String metalPath = metal4 ? "metal4" : "metal3";
-        String mslVersion = metal4 ? "4.0" : "3.0";
+    static PipelineCacheIdentity create(final MTLDevice device) {
+        String metalPath = "metal4";
+        String mslVersion = MetalCrossShaderCompiler.MSL_VERSION_NAME;
         String key = hash(
                 "registry=" + Long.toUnsignedString(device.registryId()),
                 "os=" + osBuild(),
@@ -57,8 +56,7 @@ final class PipelineCacheIdentity {
         Path directory = FabricLoader.getInstance().getConfigDir()
                 .resolve("metallum")
                 .resolve("pipeline-cache");
-        Path archive = directory.resolve(metalPath + "-" + key
-                + (metal4 ? ".mtl4archive" : ".metallibarchive"));
+        Path archive = directory.resolve(metalPath + "-" + key + ".mtl4archive");
         return new PipelineCacheIdentity(
                 key,
                 archive,
@@ -71,23 +69,22 @@ final class PipelineCacheIdentity {
     }
 
     String recordPipeline(
-            final RenderPipeline pipeline,
+            final BackendRenderPipeline.CreateInfo pipeline,
             final String vertexMsl,
             final String fragmentMsl
     ) {
         String fingerprint = hash(
                 this.globalKey,
-                pipeline.getLocation().toString(),
-                pipeline.getVertexShader().toString(),
-                pipeline.getFragmentShader().toString(),
-                pipeline.getShaderDefines().toString(),
-                pipeline.getBindGroupLayouts().toString(),
-                String.valueOf(pipeline.getDepthStencilState()),
-                String.valueOf(pipeline.getColorTargetState()),
-                String.valueOf(pipeline.getPolygonMode()),
-                Boolean.toString(pipeline.isCull()),
-                String.valueOf(pipeline.getPrimitiveTopology()),
-                Arrays.toString(pipeline.getVertexFormatBindings()),
+                pipeline.name(),
+                pipeline.uniforms().toString(),
+                Integer.toString(pipeline.pushConstantsSize()),
+                String.valueOf(pipeline.depthStencilState()),
+                pipeline.colorTargetStates().toString(),
+                String.valueOf(pipeline.polygonMode()),
+                Boolean.toString(pipeline.cull()),
+                String.valueOf(pipeline.primitiveTopology()),
+                pipeline.vertexBuffers().toString(),
+                pipeline.attribBindings().toString(),
                 vertexMsl,
                 fragmentMsl
         );

@@ -5,6 +5,7 @@ import com.metallum.mtl.MTLIndexType;
 import com.metallum.mtl.MTLIndirectCommandBuffer;
 import com.metallum.mtl.MTLPrimitiveType;
 import com.metallum.mtl.MTLRenderCommandEncoder;
+import com.metallum.mixin.render.FrontendRenderPassAccessor;
 import net.caffeinemc.mods.sodium.client.gpu.device.batch.MultiDrawBatch;
 import net.caffeinemc.mods.sodium.client.gpu.device.context.DrawContext;
 
@@ -53,10 +54,11 @@ public final class MetalIndirectDrawBatch extends MultiDrawBatch {
 
     @Override
     public void draw(final DrawContext context) {
-        if (!(context instanceof MetalDrawContext metalContext)) {
-            throw new IllegalArgumentException("Metal batch requires MetalDrawContext");
+        if (!(context.getPass() instanceof FrontendRenderPassAccessor frontendPass)
+                || !(frontendPass.metallum$getBackend() instanceof MetalRenderPass metalPass)) {
+            throw new IllegalStateException("Metal batch requires an active Metal render pass");
         }
-        metalContext.draw(this);
+        metalPass.drawBatch(this);
     }
 
     boolean execute(
@@ -89,7 +91,7 @@ public final class MetalIndirectDrawBatch extends MultiDrawBatch {
                 return false;
             }
         }
-        encoder.executeCommands(this.commands, this.size, indexBuffer);
+        encoder.executeCommands(this.commands, this.size);
         Stats.increment(Stats.Counter.ICB_EXECUTIONS);
         Stats.add(Stats.Counter.ICB_COMMANDS, this.size);
         Stats.add(Stats.Counter.DRAWS, this.size);

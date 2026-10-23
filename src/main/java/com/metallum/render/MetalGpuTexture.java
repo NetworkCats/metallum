@@ -3,8 +3,9 @@ package com.metallum.render;
 import com.metallum.mtl.*;
 import com.metallum.objc.Msg;
 import com.metallum.objc.ObjC;
-import com.mojang.blaze3d.GpuFormat;
-import com.mojang.blaze3d.textures.GpuTexture;
+import com.mojang.renderpearl.api.GpuFormat;
+import com.mojang.renderpearl.backend.common.BaseGpuTexture;
+import com.mojang.renderpearl.api.textures.GpuTexture;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import org.joml.Vector4fc;
@@ -13,7 +14,7 @@ import org.jspecify.annotations.Nullable;
 import java.lang.foreign.MemorySegment;
 
 @Environment(EnvType.CLIENT)
-final class MetalGpuTexture extends GpuTexture {
+final class MetalGpuTexture extends BaseGpuTexture {
     private static final Msg SET_LABEL = Msg.ofVoid("setLabel:", java.lang.foreign.ValueLayout.ADDRESS);
 
     private final MetalDevice device;

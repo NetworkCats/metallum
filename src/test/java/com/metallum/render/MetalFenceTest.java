@@ -13,4 +13,10 @@ final class MetalFenceTest {
         assertEquals(2L, MetalFence.timeoutMillis(1_000_001L));
         assertEquals(9_223_372_036_855L, MetalFence.timeoutMillis(Long.MAX_VALUE));
     }
+
+    @Test
+    void negativeTimeoutsWaitIndefinitely() {
+        assertEquals(Long.MAX_VALUE, MetalFence.timeoutMillis(-1L));
+        assertEquals(Long.MAX_VALUE, MetalFence.timeoutMillis(Long.MIN_VALUE));
+    }
 }

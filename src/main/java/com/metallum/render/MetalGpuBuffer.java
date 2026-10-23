@@ -7,8 +7,9 @@ import com.metallum.mtl.MTLResourceOptions;
 import com.metallum.mtl.MTLStorageMode;
 import com.metallum.mtl.MTLTexture;
 import com.metallum.objc.ObjC;
-import com.mojang.blaze3d.buffers.GpuBuffer;
-import com.mojang.blaze3d.buffers.GpuBufferSlice;
+import com.mojang.renderpearl.api.buffers.GpuBuffer;
+import com.mojang.renderpearl.backend.common.BaseGpuBuffer;
+import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import org.jspecify.annotations.NonNull;
@@ -21,7 +22,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 @Environment(EnvType.CLIENT)
-class MetalGpuBuffer extends GpuBuffer {
+class MetalGpuBuffer extends BaseGpuBuffer {
     private final MetalDevice device;
     private final boolean cpuAccessible;
     private final boolean dynamic;

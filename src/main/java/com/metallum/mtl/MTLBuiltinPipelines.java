@@ -10,6 +10,7 @@ import org.jspecify.annotations.Nullable;
 import org.lwjgl.system.MemoryStack;
 
 import java.lang.foreign.MemorySegment;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.function.Consumer;
@@ -57,19 +58,20 @@ public final class MTLBuiltinPipelines {
             }
             """;
 
+    /** Maximum color attachments the clear shader can address. */
+    public static final int MAX_COLOR_ATTACHMENTS = 8;
+    private static final int CLEAR_UNIFORMS_SIZE = 16 + 16 * MAX_COLOR_ATTACHMENTS;
     private static final String CLEAR_MSL = """
             #include <metal_stdlib>
             using namespace metal;
             
             struct ClearUniforms {
-              float z;
-              float3 _padding0;
-              float4 color;
+              float4 z;
+              float4 colors[8];
             };
             
             struct ClearVertexOut {
               float4 position [[position]];
-              float4 color;
             };
             
             vertex ClearVertexOut metallum_clear_vs(
@@ -83,52 +85,39 @@ public final class MTLBuiltinPipelines {
               };
             
               ClearVertexOut out;
-              out.position = float4(positions[vertexId], u.z, 1.0);
-              out.color = u.color;
+              out.position = float4(positions[vertexId], u.z.x, 1.0);
               return out;
-            }
-            
-            fragment float4 metallum_clear_fs(ClearVertexOut in [[stage_in]]) {
-              return in.color;
             }
             """;
 
     private static MTLDevice device;
-    @Nullable
     private static MTLResidencySet residencySet;
-    @Nullable
-    private static MTL4Compiler metal4Compiler;
-    @Nullable
-    private static MTLBinaryArchive metal3Archive;
+    private static MTL4Compiler compiler;
     private static MemorySegment presentPipeline = MemorySegment.NULL;
     private static MemorySegment presentLinearSampler = MemorySegment.NULL;
     private static MemorySegment presentNearestSampler = MemorySegment.NULL;
-    private static final Map<Long, MemorySegment> clearPipelines = new HashMap<>();
+    private static final Map<ClearPipelineKey, MemorySegment> clearPipelines = new HashMap<>();
     private static final Map<Long, MemorySegment> depthStencilStates = new HashMap<>();
     private static final Map<String, MemorySegment> libraries = new HashMap<>();
-    private static final Map<BuiltinFunctionKey, MemorySegment> functions = new HashMap<>();
 
     private MTLBuiltinPipelines() {
     }
 
     public static void init(
             final MTLDevice mtlDevice,
-            @Nullable final MTLResidencySet liveResidencySet,
-            @Nullable final MTL4Compiler compiler,
-            @Nullable final MTLBinaryArchive binaryArchive
+            final MTLResidencySet liveResidencySet,
+            final MTL4Compiler metalCompiler
     ) {
         device = mtlDevice;
         residencySet = liveResidencySet;
-        metal4Compiler = compiler;
-        metal3Archive = binaryArchive;
+        compiler = metalCompiler;
         try {
             presentPipeline = buildPipeline(PRESENT_MSL, "metallum_present_vs", "metallum_present_fs",
-                    MTLPixelFormat.BGRA8Unorm.value, MTLPixelFormat.Invalid.value, MTLColorWriteMask.All.value);
+                    new long[]{MTLPixelFormat.BGRA8Unorm.value}, 1);
             presentLinearSampler = buildPresentSampler(MTLSamplerMinMagFilter.Linear);
             presentNearestSampler = buildPresentSampler(MTLSamplerMinMagFilter.Nearest);
-            ensureClearPipeline(MTLPixelFormat.BGRA8Unorm.value, MTLPixelFormat.Depth32Float.value, true);
-            ensureClearPipeline(MTLPixelFormat.RGBA8Unorm.value, MTLPixelFormat.Depth32Float.value, true);
-            ensureClearPipeline(MTLPixelFormat.BGRA8Unorm.value, MTLPixelFormat.Invalid.value, true);
+            ensureClearPipeline(new long[]{MTLPixelFormat.BGRA8Unorm.value}, 1);
+            ensureClearPipeline(new long[]{MTLPixelFormat.RGBA8Unorm.value}, 1);
         } catch (Throwable throwable) {
             try {
                 close();
@@ -156,56 +145,57 @@ public final class MTLBuiltinPipelines {
         clearPipelines.clear();
         depthStencilStates.values().forEach(ObjC::release);
         depthStencilStates.clear();
-        functions.values().forEach(MTLBuiltinPipelines::releaseIfPresent);
-        functions.clear();
         libraries.values().forEach(MTLBuiltinPipelines::releaseIfPresent);
         libraries.clear();
         if (residencySet != null) {
             residencySet.commitIfNeeded();
         }
         residencySet = null;
-        metal4Compiler = null;
-        metal3Archive = null;
+        compiler = null;
         device = null;
     }
 
-    static void clearDraw(
+    /**
+     * Clears a region of every attachment of the currently open render encoder by drawing a
+     * full-screen triangle clipped to the region. {@code clearColors[i] == null} leaves attachment
+     * {@code i} untouched.
+     */
+    public static void clearDraw(
             final MTLRenderCommandEncoder encoder,
-            final MemorySegment colorTexture,
-            final MemorySegment depthTexture,
-            final double viewportWidth,
-            final double viewportHeight,
-            @Nullable final Vector4fc clearColor,
-            @Nullable final Double clearDepth
+            final long[] colorFormats,
+            final boolean hasDepth,
+            final long targetWidth,
+            final long targetHeight,
+            @Nullable final Vector4fc[] clearColors,
+            @Nullable final Double clearDepth,
+            final long x,
+            final long y,
+            final long width,
+            final long height
     ) {
+        long left = Math.max(x, 0L);
+        long top = Math.max(y, 0L);
+        long right = Math.min(x + width, targetWidth);
+        long bottom = Math.min(y + height, targetHeight);
+        if (left >= right || top >= bottom) {
+            return;
+        }
+        if (clearDepth == null && writeBits(clearColors) == 0) {
+            return;
+        }
         try (AutoreleasePool _ = AutoreleasePool.push()) {
-            MemorySegment sizeTexture = ObjC.isNil(colorTexture) ? depthTexture : colorTexture;
-            if (ObjC.isNil(sizeTexture)) {
-                return;
-            }
-
-            long colorFormat = ObjC.isNil(colorTexture) ? MTLPixelFormat.Invalid.value : MTLTexture.pixelFormat(colorTexture);
-            long depthFormat = ObjC.isNil(depthTexture) ? MTLPixelFormat.Invalid.value : MTLTexture.pixelFormat(depthTexture);
-            MemorySegment pipeline = ensureClearPipeline(colorFormat, depthFormat, clearColor != null);
+            MemorySegment pipeline = ensureClearPipeline(colorFormats, writeBits(clearColors));
             if (ObjC.isNil(pipeline)) {
                 return;
             }
-
-            MemorySegment depthState = depthFormat != MTLPixelFormat.Invalid.value
+            MemorySegment depthState = hasDepth
                     ? ensureDepthStencilState(MTLCompareFunction.Always, clearDepth != null)
                     : MemorySegment.NULL;
-
-            long width = MTLTexture.width(sizeTexture);
-            long height = MTLTexture.height(sizeTexture);
-            if (width <= 0 || height <= 0) {
-                return;
-            }
-
             encodeClearDraw(
                     encoder, pipeline,
-                    (long) viewportWidth, (long) viewportHeight,
-                    clearColor,
-                    0L, 0L, width, height,
+                    targetWidth, targetHeight,
+                    clearColors,
+                    left, top, right - left, bottom - top,
                     depthState, clearDepth
             );
         }
@@ -221,7 +211,8 @@ public final class MTLBuiltinPipelines {
             final int y,
             final int width,
             final int height,
-            final MTLFence globalFence,
+            final int mipLevel,
+            @Nullable final MTLFence globalFence,
             @Nullable final Consumer<MTLRenderCommandEncoder> beginEncoder,
             @Nullable final Consumer<MTLRenderCommandEncoder> finishEncoder
     ) {
@@ -230,8 +221,8 @@ public final class MTLBuiltinPipelines {
                 return;
             }
 
-            long textureWidth = Math.min(MTLTexture.width(colorTexture), MTLTexture.width(depthTexture));
-            long textureHeight = Math.min(MTLTexture.height(colorTexture), MTLTexture.height(depthTexture));
+            long textureWidth = Math.max(1L, Math.min(MTLTexture.width(colorTexture), MTLTexture.width(depthTexture)) >> mipLevel);
+            long textureHeight = Math.max(1L, Math.min(MTLTexture.height(colorTexture), MTLTexture.height(depthTexture)) >> mipLevel);
             long clampedX = Math.max(x, 0);
             long clampedY = Math.max(y, 0);
             long clampedMaxX = Math.min((long) x + width, textureWidth);
@@ -242,16 +233,19 @@ public final class MTLBuiltinPipelines {
             boolean fullRegion = clampedX == 0 && clampedY == 0 && clampedMaxX == textureWidth && clampedMaxY == textureHeight;
 
             MTLRenderCommandEncoder encoder;
-            try (MTLRenderPassDescriptor renderPass = new MTLRenderPassDescriptor(commandBuffer.isMetal4())) {
+            try (MTLRenderPassDescriptor renderPass = new MTLRenderPassDescriptor()) {
                 renderPass.colorAttachment(
                         0,
                         colorTexture,
+                        mipLevel,
                         fullRegion ? MTLRenderPassDescriptor.LOAD_ACTION_CLEAR : MTLRenderPassDescriptor.LOAD_ACTION_LOAD,
                         MTLRenderPassDescriptor.STORE_ACTION_STORE,
                         clearColor
                 );
                 renderPass.depthAttachment(
                         depthTexture,
+                        mipLevel,
+                        0L,
                         fullRegion ? MTLRenderPassDescriptor.LOAD_ACTION_CLEAR : MTLRenderPassDescriptor.LOAD_ACTION_LOAD,
                         MTLRenderPassDescriptor.STORE_ACTION_STORE,
                         clearDepth
@@ -259,6 +253,8 @@ public final class MTLBuiltinPipelines {
                 if (MTLPixelFormat.hasStencil(MTLTexture.pixelFormat(depthTexture))) {
                     renderPass.stencilAttachment(
                             depthTexture,
+                            mipLevel,
+                            0L,
                             MTLRenderPassDescriptor.LOAD_ACTION_DONT_CARE,
                             MTLRenderPassDescriptor.STORE_ACTION_DONT_CARE
                     );
@@ -271,17 +267,14 @@ public final class MTLBuiltinPipelines {
                 }
 
                 if (!fullRegion) {
-                    MemorySegment pipeline = ensureClearPipeline(MTLTexture.pixelFormat(colorTexture), MTLTexture.pixelFormat(depthTexture), true);
-                    MemorySegment depthState = ensureDepthStencilState(MTLCompareFunction.Always, true);
-                    if (ObjC.isNil(pipeline) || ObjC.isNil(depthState)) {
-                        return;
-                    }
-                    encodeClearDraw(
-                            encoder, pipeline,
+                    clearDraw(
+                            encoder,
+                            new long[]{MTLTexture.pixelFormat(colorTexture)},
+                            true,
                             textureWidth, textureHeight,
-                            clearColor,
-                            clampedX, clampedY, clampedMaxX - clampedX, clampedMaxY - clampedY,
-                            depthState, clearDepth
+                            new Vector4fc[]{clearColor},
+                            clearDepth,
+                            clampedX, clampedY, clampedMaxX - clampedX, clampedMaxY - clampedY
                     );
                 }
 
@@ -296,7 +289,7 @@ public final class MTLBuiltinPipelines {
             final MTLCommandBuffer commandBuffer,
             final CAMetalLayer layer,
             final MemorySegment sourceTexture,
-            final MTLFence globalFence,
+            @Nullable final MTLFence globalFence,
             @Nullable final Consumer<MTLRenderCommandEncoder> beginEncoder,
             @Nullable final Consumer<MTLRenderCommandEncoder> finishEncoder
     ) {
@@ -312,7 +305,7 @@ public final class MTLBuiltinPipelines {
             MemorySegment drawableTexture = drawable.texture();
 
             MTLRenderCommandEncoder encoder;
-            try (MTLRenderPassDescriptor renderPass = new MTLRenderPassDescriptor(commandBuffer.isMetal4())) {
+            try (MTLRenderPassDescriptor renderPass = new MTLRenderPassDescriptor()) {
                 renderPass.colorAttachment(
                         0,
                         drawableTexture,
@@ -332,11 +325,11 @@ public final class MTLBuiltinPipelines {
                 long drawableHeight = MTLTexture.height(drawableTexture);
                 encoder.setViewport(0.0, 0.0, drawableWidth, drawableHeight, 0.0, 1.0);
                 encoder.setRenderPipelineState(presentPipeline);
-                encoder.setFragmentTexture(sourceTexture, 0L);
+                encoder.setTexture(sourceTexture, 0L);
 
                 boolean requiresScaling = MTLTexture.width(sourceTexture) != drawableWidth
                         || MTLTexture.height(sourceTexture) != drawableHeight;
-                encoder.setFragmentSamplerState(requiresScaling ? presentLinearSampler : presentNearestSampler, 0L);
+                encoder.setSamplerState(requiresScaling ? presentLinearSampler : presentNearestSampler, 0L);
 
                 encoder.drawPrimitives(MTLPrimitiveType.Triangle, 0, 3, 1, 0);
 
@@ -404,7 +397,7 @@ public final class MTLBuiltinPipelines {
             final MemorySegment pipeline,
             final long viewportWidth,
             final long viewportHeight,
-            @Nullable final Vector4fc clearColor,
+            @Nullable final Vector4fc[] clearColors,
             final long scissorX,
             final long scissorY,
             final long scissorWidth,
@@ -415,36 +408,82 @@ public final class MTLBuiltinPipelines {
         encoder.setViewport(0.0, 0.0, viewportWidth, viewportHeight, 0.0, 1.0);
         encoder.setScissorRect(scissorX, scissorY, scissorWidth, scissorHeight);
         encoder.setRenderPipelineState(pipeline);
+        encoder.setCullMode(MTLCullMode.None);
+        encoder.setTriangleFillMode(MTLTriangleFillMode.Fill);
         if (!ObjC.isNil(depthState)) {
             encoder.setDepthStencilState(depthState);
+            encoder.setDepthBias(0.0f, 0.0f, 0.0f);
         }
 
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            MemorySegment uniforms = MemorySegment.ofAddress(stack.nmalloc(16, 48)).reinterpret(48);
+            MemorySegment uniforms = MemorySegment.ofAddress(stack.ncalloc(16, 1, CLEAR_UNIFORMS_SIZE))
+                    .reinterpret(CLEAR_UNIFORMS_SIZE);
             float z = ObjC.isNil(depthState) || clearDepth == null ? 0.0f : (float) Math.clamp(clearDepth, 0.0, 1.0);
             uniforms.set(JAVA_FLOAT, 0, z);
-            uniforms.set(JAVA_FLOAT, 32, clearColor == null ? 0.0f : clearColor.x());
-            uniforms.set(JAVA_FLOAT, 36, clearColor == null ? 0.0f : clearColor.y());
-            uniforms.set(JAVA_FLOAT, 40, clearColor == null ? 0.0f : clearColor.z());
-            uniforms.set(JAVA_FLOAT, 44, clearColor == null ? 0.0f : clearColor.w());
-            encoder.setVertexBytes(uniforms, 48L, 1L);
+            for (int i = 0; clearColors != null && i < clearColors.length && i < MAX_COLOR_ATTACHMENTS; i++) {
+                Vector4fc color = clearColors[i];
+                if (color == null) {
+                    continue;
+                }
+                long offset = 16L + 16L * i;
+                uniforms.set(JAVA_FLOAT, offset, color.x());
+                uniforms.set(JAVA_FLOAT, offset + 4, color.y());
+                uniforms.set(JAVA_FLOAT, offset + 8, color.z());
+                uniforms.set(JAVA_FLOAT, offset + 12, color.w());
+            }
+            encoder.setBytes(uniforms, CLEAR_UNIFORMS_SIZE, 1L);
         }
 
         encoder.drawPrimitives(MTLPrimitiveType.Triangle, 0, 3, 1, 0);
+        // Built-in draws replace the client's pipeline and bindings.
+        encoder.invalidateBindingCache();
     }
 
-    private static MemorySegment ensureClearPipeline(final long colorFormat, final long depthFormat, final boolean writeColor) {
-        long key = (colorFormat << 32) | (depthFormat << 1) | (writeColor ? 1L : 0L);
+    private static MemorySegment ensureClearPipeline(final long[] colorFormats, final int writeBits) {
+        ClearPipelineKey key = new ClearPipelineKey(Arrays.toString(colorFormats), writeBits);
         MemorySegment cached = clearPipelines.get(key);
         if (cached != null) {
             return cached;
         }
-        MemorySegment pipeline = buildPipeline(CLEAR_MSL, "metallum_clear_vs", "metallum_clear_fs",
-                colorFormat, depthFormat, writeColor ? MTLColorWriteMask.All.value : MTLColorWriteMask.None.value);
+        MemorySegment pipeline = buildPipeline(CLEAR_MSL + clearFragmentMsl(colorFormats), "metallum_clear_vs", "metallum_clear_fs",
+                colorFormats, writeBits);
         if (!ObjC.isNil(pipeline)) {
             clearPipelines.put(key, pipeline);
         }
         return pipeline;
+    }
+
+    private static String clearFragmentMsl(final long[] colorFormats) {
+        StringBuilder outputs = new StringBuilder();
+        StringBuilder writes = new StringBuilder();
+        for (int i = 0; i < colorFormats.length; i++) {
+            if (colorFormats[i] != MTLPixelFormat.Invalid.value) {
+                outputs.append("  float4 color%d [[color(%d)]];\n".formatted(i, i));
+                writes.append("  out.color%d = u.colors[%d];\n".formatted(i, i));
+            }
+        }
+        if (outputs.isEmpty()) {
+            return "fragment void metallum_clear_fs() {}\n";
+        }
+        return """
+                struct ClearFragmentOut {
+                %s};
+                
+                fragment ClearFragmentOut metallum_clear_fs(constant ClearUniforms& u [[buffer(1)]]) {
+                  ClearFragmentOut out;
+                %s  return out;
+                }
+                """.formatted(outputs, writes);
+    }
+
+    private static int writeBits(@Nullable final Vector4fc[] clearColors) {
+        int bits = 0;
+        for (int i = 0; clearColors != null && i < clearColors.length; i++) {
+            if (clearColors[i] != null) {
+                bits |= 1 << i;
+            }
+        }
+        return bits;
     }
 
     private static MemorySegment ensureDepthStencilState(final MTLCompareFunction compareOp, final boolean writeDepth) {
@@ -468,60 +507,32 @@ public final class MTLBuiltinPipelines {
             final String mslSource,
             final String vertexEntry,
             final String fragmentEntry,
-            final long colorFormat,
-            final long depthFormat,
-            final long writeMask
+            final long[] colorFormats,
+            final int writeBits
     ) {
-        if (metal4Compiler != null) {
-            MemorySegment library = libraries.computeIfAbsent(mslSource, metal4Compiler::newLibrary);
-            if (ObjC.isNil(library)) {
-                return MemorySegment.NULL;
-            }
-            MemorySegment pipeline;
-            try (MTL4RenderPipelineDescriptor descriptor = new MTL4RenderPipelineDescriptor()) {
-                descriptor.setFunctions(library, vertexEntry, library, fragmentEntry);
-                descriptor.setColorAttachmentFormat(0, colorFormat);
-                descriptor.setInputPrimitiveTopology(3L);
-                descriptor.disableBlending(0, writeMask);
-                pipeline = metal4Compiler.newRenderPipelineState(descriptor);
-            }
-            if (!ObjC.isNil(pipeline) && residencySet != null) {
-                residencySet.addAllocation(pipeline);
-            }
-            return pipeline;
-        }
-
-        MemorySegment vertexFunction = function(mslSource, vertexEntry);
-        MemorySegment fragmentFunction = function(mslSource, fragmentEntry);
-        if (ObjC.isNil(vertexFunction) || ObjC.isNil(fragmentFunction)) {
+        MemorySegment library = libraries.computeIfAbsent(mslSource, compiler::newLibrary);
+        if (ObjC.isNil(library)) {
             return MemorySegment.NULL;
         }
         MemorySegment pipeline;
-        try (MTLRenderPipelineDescriptor descriptor = new MTLRenderPipelineDescriptor()) {
-            descriptor.setLabel(vertexEntry + "/" + fragmentEntry);
-            descriptor.setCompiledFunctions(vertexFunction, fragmentFunction);
-            descriptor.setColorAttachmentFormat(0, colorFormat);
-            descriptor.setDepthStencilFormats(depthFormat, MTLPixelFormat.Invalid.value);
-            descriptor.disableBlending(0, writeMask);
-            if (metal3Archive != null) {
-                descriptor.setBinaryArchive(metal3Archive.handle());
-                metal3Archive.addRenderPipeline(descriptor);
+        try (MTL4RenderPipelineDescriptor descriptor = new MTL4RenderPipelineDescriptor()) {
+            descriptor.setFunctions(library, vertexEntry, library, fragmentEntry);
+            for (int i = 0; i < colorFormats.length; i++) {
+                if (colorFormats[i] == MTLPixelFormat.Invalid.value) {
+                    continue;
+                }
+                descriptor.setColorAttachmentFormat(i, colorFormats[i]);
+                descriptor.disableBlending(i, (writeBits & (1 << i)) != 0
+                        ? MTLColorWriteMask.All.value
+                        : MTLColorWriteMask.None.value);
             }
-            pipeline = device.newRenderPipelineStateAsync(descriptor);
+            descriptor.setInputPrimitiveTopology(3L);
+            pipeline = compiler.newRenderPipelineState(descriptor);
         }
-        if (!ObjC.isNil(pipeline) && residencySet != null) {
+        if (!ObjC.isNil(pipeline)) {
             residencySet.addAllocation(pipeline);
         }
         return pipeline;
-    }
-
-    private static MemorySegment function(final String mslSource, final String entryPoint) {
-        return functions.computeIfAbsent(new BuiltinFunctionKey(mslSource, entryPoint), key -> {
-            MemorySegment library = libraries.computeIfAbsent(key.mslSource(), device::newLibrary);
-            return ObjC.isNil(library)
-                    ? MemorySegment.NULL
-                    : device.newFunction(library, key.entryPoint());
-        });
     }
 
     private static MemorySegment buildPresentSampler(final MTLSamplerMinMagFilter filter) {
@@ -552,7 +563,6 @@ public final class MTLBuiltinPipelines {
         }
     }
 
-    private record BuiltinFunctionKey(String mslSource, String entryPoint) {
+    private record ClearPipelineKey(String colorFormats, int writeBits) {
     }
-
 }

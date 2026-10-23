@@ -8,7 +8,6 @@ import org.lwjgl.system.MemoryStack;
 import java.lang.foreign.MemorySegment;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
-import static java.lang.foreign.ValueLayout.JAVA_BOOLEAN;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
 @Environment(EnvType.CLIENT)
@@ -21,20 +20,16 @@ public final class MTLBlitCommandEncoder extends MTLCommandEncoder {
             ADDRESS, JAVA_LONG, JAVA_LONG, ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, JAVA_LONG, ADDRESS);
     private static final Msg COPY_TEXTURE_TO_BUFFER = Msg.ofVoid("copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:",
             ADDRESS, JAVA_LONG, JAVA_LONG, ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, JAVA_LONG, JAVA_LONG);
-    private static final Msg UPDATE_FENCE = Msg.ofVoid("updateFence:", ADDRESS);
-    private static final Msg WAIT_FOR_FENCE = Msg.ofVoid("waitForFence:", ADDRESS);
     private static final Msg MTL4_UPDATE_FENCE =
             Msg.ofVoid("updateFence:afterEncoderStages:", ADDRESS, JAVA_LONG);
     private static final Msg MTL4_WAIT_FOR_FENCE =
             Msg.ofVoid("waitForFence:beforeEncoderStages:", ADDRESS, JAVA_LONG);
     private static final long MTL_STAGE_BLIT = 1L << 28;
-    private static final Msg SAMPLE_COUNTERS = Msg.ofVoid(
-            "sampleCountersInBuffer:atSampleIndex:withBarrier:", ADDRESS, JAVA_LONG, JAVA_BOOLEAN);
     private static final Msg MTL4_WRITE_TIMESTAMP = Msg.ofVoid(
             "writeTimestampWithGranularity:intoHeap:atIndex:", JAVA_LONG, ADDRESS, JAVA_LONG);
 
-    MTLBlitCommandEncoder(final MemorySegment handle, final boolean metal4) {
-        super(handle, metal4);
+    MTLBlitCommandEncoder(final MemorySegment handle) {
+        super(handle);
     }
 
     public void copyFromBufferToBuffer(
@@ -136,26 +131,14 @@ public final class MTLBlitCommandEncoder extends MTLCommandEncoder {
     }
 
     public void updateFence(final MTLFence fence) {
-        if (this.metal4) {
-            MTL4_UPDATE_FENCE.send(handle(), fence.handle(), MTL_STAGE_BLIT);
-        } else {
-            UPDATE_FENCE.send(handle(), fence.handle());
-        }
+        MTL4_UPDATE_FENCE.send(handle(), fence.handle(), MTL_STAGE_BLIT);
     }
 
     public void waitForFence(final MTLFence fence) {
-        if (this.metal4) {
-            MTL4_WAIT_FOR_FENCE.send(handle(), fence.handle(), MTL_STAGE_BLIT);
-        } else {
-            WAIT_FOR_FENCE.send(handle(), fence.handle());
-        }
+        MTL4_WAIT_FOR_FENCE.send(handle(), fence.handle(), MTL_STAGE_BLIT);
     }
 
     public void writeTimestamp(final MTLGpuCounterPool pool, final long index) {
-        if (this.metal4) {
-            MTL4_WRITE_TIMESTAMP.send(handle(), 0L, pool.handle(), index);
-        } else {
-            SAMPLE_COUNTERS.send(handle(), pool.handle(), index, false);
-        }
+        MTL4_WRITE_TIMESTAMP.send(handle(), 0L, pool.handle(), index);
     }
 }

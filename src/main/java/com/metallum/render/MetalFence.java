@@ -1,6 +1,6 @@
 package com.metallum.render;
 
-import com.mojang.blaze3d.buffers.GpuFence;
+import com.mojang.renderpearl.api.commands.GpuFence;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 
@@ -25,7 +25,11 @@ final class MetalFence implements GpuFence {
         return this.closed || this.encoder.awaitSubmitCompletion(this.submitIndex, timeoutMillis(timeoutNS));
     }
 
+    /** Negative timeouts wait indefinitely (MappableRingBuffer passes -1); zero only polls. */
     static long timeoutMillis(final long timeoutNS) {
-        return timeoutNS <= 0L ? 0L : 1L + (timeoutNS - 1L) / 1_000_000L;
+        if (timeoutNS < 0L) {
+            return Long.MAX_VALUE;
+        }
+        return timeoutNS == 0L ? 0L : 1L + (timeoutNS - 1L) / 1_000_000L;
     }
 }

@@ -2,13 +2,15 @@ package com.metallum.render;
 
 import com.metallum.mtl.*;
 import com.metallum.objc.ObjC;
-import com.metallum.objc.ObjCBlock;
-import com.mojang.blaze3d.buffers.GpuBuffer;
-import com.mojang.blaze3d.buffers.GpuBufferSlice;
-import com.mojang.blaze3d.buffers.GpuFence;
-import com.mojang.blaze3d.systems.*;
-import com.mojang.blaze3d.textures.GpuTexture;
-import com.mojang.blaze3d.textures.GpuTextureView;
+import com.mojang.renderpearl.api.buffers.GpuBuffer;
+import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
+import com.mojang.renderpearl.api.commands.GpuFence;
+import com.mojang.renderpearl.api.buffers.*;
+import com.mojang.renderpearl.api.commands.*;
+import com.mojang.renderpearl.api.device.*;
+import com.mojang.renderpearl.backend.api.*;
+import com.mojang.renderpearl.api.textures.GpuTexture;
+import com.mojang.renderpearl.api.textures.GpuTextureView;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
@@ -21,12 +23,11 @@ import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.*;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.TimeUnit;
 
 @Environment(EnvType.CLIENT)
 final class MetalCommandEncoder implements CommandEncoderBackend {
     public static final int MAX_SUBMITS_IN_FLIGHT = 3;
+    private static final MemorySegment[] NO_ATTACHMENTS = new MemorySegment[0];
     static final long STAGE_VERTEX = 1L;
     static final long STAGE_FRAGMENT = 1L << 1;
     static final long STAGE_BLIT = 1L << 28;
@@ -39,22 +40,13 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
     private final MetalDevice device;
     private long currentSubmitIndex = MAX_SUBMITS_IN_FLIGHT;
     private final InFlight[] inFlight = new InFlight[MAX_SUBMITS_IN_FLIGHT];
-    private final Semaphore[] submitSemaphores = new Semaphore[MAX_SUBMITS_IN_FLIGHT];
-    private final MemorySegment[] submitSignalBlocks = new MemorySegment[MAX_SUBMITS_IN_FLIGHT];
     private final MetalDestructionQueue destroyQueue = new MetalDestructionQueue(MAX_SUBMITS_IN_FLIGHT);
     private final MetalTransientMemory transientMemory;
     private final Map<MetalGpuTexture, Vector4fc> pendingColorClears = new IdentityHashMap<>();
     private final Map<MetalGpuTexture, Double> pendingDepthClears = new IdentityHashMap<>();
     private final MTLFence fence;
     private final ResourceAccessTracker accessTracker = new ResourceAccessTracker();
-    private final List<MTLFence>[] dependencyFences;
     private long activeEncoderId = -1L;
-    @Nullable
-    private MTLFence activeDependencyFence;
-    @Nullable
-    private MTLFence previousSubmissionFence;
-    @Nullable
-    private MTLFence currentSubmissionLastFence;
     private long previousSubmissionStages;
     private long currentSubmissionStages;
     private boolean currentSubmissionHasEncoder;
@@ -64,7 +56,7 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
     private MTLCommandBuffer commandBuffer;
     @Nullable
     private MTLCommandEncoder currentEncoder;
-    private MemorySegment renderColorAttachment = MemorySegment.NULL;
+    private MemorySegment[] renderColorAttachments = NO_ATTACHMENTS;
     private MemorySegment renderDepthAttachment = MemorySegment.NULL;
     private final Long2ObjectOpenHashMap<ArrayDeque<MTLBuffer>> dynamicBackingPool = new Long2ObjectOpenHashMap<>();
     private final Set<MetalGpuBuffer> pendingDynamicBuffers =
@@ -74,15 +66,6 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         this.device = device;
         this.transientMemory = new MetalTransientMemory(device, this);
         fence = device.metalDevice().newFence();
-        @SuppressWarnings("unchecked")
-        List<MTLFence>[] fences = (List<MTLFence>[]) new List<?>[MAX_SUBMITS_IN_FLIGHT];
-        this.dependencyFences = fences;
-        for (int slot = 0; slot < MAX_SUBMITS_IN_FLIGHT; slot++) {
-            this.dependencyFences[slot] = new ArrayList<>();
-            Semaphore semaphore = new Semaphore(0);
-            submitSemaphores[slot] = semaphore;
-            submitSignalBlocks[slot] = ObjCBlock.withRunnable(semaphore::release);
-        }
     }
 
     boolean belongsTo(final MetalDevice device) {
@@ -119,7 +102,7 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             if (currentEncoder instanceof MTLRenderCommandEncoder renderEncoder) {
                 if (trackerEnabled()) {
                     finishTrackedRenderEncoder(renderEncoder);
-                } else if (!trackerEnabled()) {
+                } else {
                     renderEncoder.updateFence(fence, MTLRenderStages.VertexAndFragment);
                     Stats.increment(Stats.Counter.FENCE_UPDATES);
                 }
@@ -129,7 +112,7 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             } else if (currentEncoder instanceof MTLBlitCommandEncoder blitEncoder) {
                 if (trackerEnabled()) {
                     finishTrackedBlitEncoder(blitEncoder);
-                } else if (!trackerEnabled()) {
+                } else {
                     blitEncoder.updateFence(fence);
                     Stats.increment(Stats.Counter.FENCE_UPDATES);
                 }
@@ -137,9 +120,8 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             currentEncoder.endEncoding();
             currentEncoder = null;
             activeEncoderId = -1L;
-            activeDependencyFence = null;
         }
-        renderColorAttachment = MemorySegment.NULL;
+        renderColorAttachments = NO_ATTACHMENTS;
         renderDepthAttachment = MemorySegment.NULL;
     }
 
@@ -157,9 +139,8 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             endEncoder();
 
             int slot = (int) (currentSubmitIndex % MAX_SUBMITS_IN_FLIGHT);
-            submitSemaphores[slot].drainPermits();
             device.commitResidencyChanges();
-            commandBuffer.commitWithCompletionBlock(submitSignalBlocks[slot]);
+            commandBuffer.commit();
 
             toClose = inFlight[slot];
             inFlight[slot] = new InFlight(currentSubmitIndex, commandBuffer);
@@ -181,6 +162,7 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         transientMemory.rotate();
         destroyQueue.rotate();
         accessTracker.reset();
+        device.flushPipelineArchiveIfIdle();
 
         if (commandError != null) {
             device.recordCommandError(commandError);
@@ -188,38 +170,58 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         }
     }
 
+    /**
+     * Returns a render encoder bound to the given attachments, reusing the open one when the
+     * attachments match. Clears outside {@code renderArea} must not touch other pixels, so
+     * partial-area clears load the attachments and draw a scissored clear instead.
+     */
     MTLRenderCommandEncoder renderCommandEncoder(
-            final MetalGpuTextureView colorTextureView,
+            final MetalGpuTextureView[] colorTextureViews,
             @Nullable final MetalGpuTextureView depthTextureView,
             final int viewportWidth,
             final int viewportHeight,
-            @Nullable final Vector4fc clearColor,
-            @Nullable final Double clearDepth
+            @Nullable final Vector4fc[] clearColors,
+            @Nullable final Double clearDepth,
+            final RenderPass.RenderArea renderArea
     ) {
-        MemorySegment colorAttachment = colorTextureView.nativeHandle();
+        MemorySegment[] colorAttachments = new MemorySegment[colorTextureViews.length];
+        long[] colorFormats = new long[colorTextureViews.length];
+        long[] colorMipLevels = new long[colorTextureViews.length];
+        boolean clear = clearDepth != null;
+        for (int i = 0; i < colorTextureViews.length; i++) {
+            MetalGpuTextureView view = colorTextureViews[i];
+            colorAttachments[i] = view == null ? MemorySegment.NULL : view.nativeHandle();
+            colorFormats[i] = view == null
+                    ? MTLPixelFormat.Invalid.value
+                    : ((MetalGpuTexture) view.texture()).mtlPixelFormat().value;
+            clear |= view != null && clearColors != null && clearColors[i] != null;
+        }
         MemorySegment depthAttachment = depthTextureView == null ? MemorySegment.NULL : depthTextureView.nativeHandle();
+
         if (currentEncoder instanceof MTLRenderCommandEncoder enc
-                && MetalPipelineSupport.sameHandle(renderColorAttachment, colorAttachment)
+                && sameAttachments(renderColorAttachments, colorAttachments)
                 && MetalPipelineSupport.sameHandle(renderDepthAttachment, depthAttachment)) {
-            if (clearColor != null || clearDepth != null) {
-                enc.clearDraw(
-                        colorAttachment,
-                        depthAttachment,
-                        viewportWidth,
-                        viewportHeight,
-                        clearColor,
-                        clearDepth
-                );
+            if (clear) {
+                clearDraw(enc, colorFormats, depthTextureView != null, viewportWidth, viewportHeight,
+                        clearColors, clearDepth, renderArea);
             }
             return enc;
         }
 
+        boolean fillsArea = renderArea.x() <= 0 && renderArea.y() <= 0
+                && renderArea.x() + renderArea.width() >= viewportWidth
+                && renderArea.y() + renderArea.height() >= viewportHeight;
+        boolean loadThenClear = clear && !fillsArea;
+
         endEncoder();
         MTLRenderCommandEncoder encoder = commandBuffer().makeRenderCommandEncoder(
-                colorAttachment,
-                clearColor,
+                colorAttachments,
+                colorMipLevels,
+                loadThenClear ? null : clearColors,
                 depthAttachment,
-                clearDepth,
+                0L,
+                0L,
+                loadThenClear ? null : clearDepth,
                 viewportWidth,
                 viewportHeight
         );
@@ -230,15 +232,20 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             encoder.waitForFence(fence, MTLRenderStages.VertexAndFragment);
             Stats.increment(Stats.Counter.FENCE_WAITS);
         } else {
-            textureAccess(
-                    ((MetalGpuTexture) colorTextureView.texture()),
-                    colorTextureView.baseMipLevel(),
-                    1,
-                    0,
-                    1,
-                    ResourceAccessTracker.Access.WRITE,
-                    STAGE_FRAGMENT
-            );
+            for (MetalGpuTextureView view : colorTextureViews) {
+                if (view == null) {
+                    continue;
+                }
+                textureAccess(
+                        (MetalGpuTexture) view.texture(),
+                        view.baseMipLevel(),
+                        1,
+                        0,
+                        1,
+                        ResourceAccessTracker.Access.WRITE,
+                        STAGE_FRAGMENT
+                );
+            }
             if (depthTextureView != null) {
                 textureAccess(
                         ((MetalGpuTexture) depthTextureView.texture()),
@@ -251,29 +258,80 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
                 );
             }
         }
-        renderColorAttachment = colorAttachment;
+        renderColorAttachments = colorAttachments;
         renderDepthAttachment = depthAttachment;
+        if (loadThenClear) {
+            clearDraw(encoder, colorFormats, depthTextureView != null, viewportWidth, viewportHeight,
+                    clearColors, clearDepth, renderArea);
+        }
         return encoder;
+    }
+
+    private static void clearDraw(
+            final MTLRenderCommandEncoder encoder,
+            final long[] colorFormats,
+            final boolean hasDepth,
+            final int targetWidth,
+            final int targetHeight,
+            @Nullable final Vector4fc[] clearColors,
+            @Nullable final Double clearDepth,
+            final RenderPass.RenderArea area
+    ) {
+        MTLBuiltinPipelines.clearDraw(
+                encoder,
+                colorFormats,
+                hasDepth,
+                targetWidth,
+                targetHeight,
+                clearColors,
+                clearDepth,
+                area.x(),
+                area.y(),
+                area.width(),
+                area.height()
+        );
+    }
+
+    private static boolean sameAttachments(final MemorySegment[] left, final MemorySegment[] right) {
+        if (left.length != right.length) {
+            return false;
+        }
+        for (int i = 0; i < left.length; i++) {
+            if (!MetalPipelineSupport.sameHandle(left[i], right[i])) {
+                return false;
+            }
+        }
+        return true;
     }
 
     @Override
     public @NonNull RenderPassBackend createRenderPass(final RenderPassDescriptor descriptor) {
-        RenderPassDescriptor.Attachment<Optional<Vector4fc>> colorAttachment = descriptor.colorAttachments().getFirst();
-        GpuTextureView colorTexture = colorAttachment.textureView();
-        MetalGpuTexture colorTex = requireTextureView(colorTexture, "Color attachment");
-        Vector4fc colorClear = colorAttachment.clearValue().orElse(null);
-        Vector4fc pendingColor = pendingColorClears.get(colorTex);
-        if (pendingColor != null && colorClear == null) {
-            if (isFullTextureView(colorTexture)) {
-                pendingColorClears.remove(colorTex);
-                colorClear = pendingColor;
-            } else {
+        RenderPass.RenderArea renderArea = descriptor.renderArea();
+        List<RenderPassDescriptor.Attachment<Optional<Vector4fc>>> attachments = descriptor.colorAttachments();
+        if (attachments.size() > MTLBuiltinPipelines.MAX_COLOR_ATTACHMENTS) {
+            throw new IllegalArgumentException("Metal supports at most " + MTLBuiltinPipelines.MAX_COLOR_ATTACHMENTS
+                    + " color attachments, got " + attachments.size());
+        }
+        GpuTextureView[] colorTextures = new GpuTextureView[attachments.size()];
+        Vector4fc[] colorClears = new Vector4fc[attachments.size()];
+        for (int i = 0; i < attachments.size(); i++) {
+            RenderPassDescriptor.Attachment<Optional<Vector4fc>> attachment = attachments.get(i);
+            if (attachment == null) {
+                continue;
+            }
+            GpuTextureView colorTexture = attachment.textureView();
+            MetalGpuTexture colorTex = requireTextureView(colorTexture, "Color attachment " + i);
+            // A pending whole-texture clear can only fold into this pass when the pass covers
+            // the full texture; otherwise materialize it first (upstream "Fix scissors").
+            if (!renderArea.fillsTexture(colorTexture) || colorTexture.baseMipLevel() != 0
+                    || colorTex.getMipLevels() != 1 || colorTex.getDepthOrLayers() != 1) {
                 flushPendingClear(colorTex);
             }
-        } else {
-            pendingColorClears.remove(colorTex);
+            Vector4fc pendingColor = pendingColorClears.remove(colorTex);
+            colorClears[i] = attachment.clearValue().orElse(pendingColor);
+            colorTextures[i] = colorTexture;
+            colorTex.markContentsDirty();
         }
-        colorTex.markContentsDirty();
 
         RenderPassDescriptor.Attachment<OptionalDouble> depthAttachment = descriptor.depthAttachment();
         GpuTextureView depthTexture = null;
@@ -281,33 +339,24 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         if (depthAttachment != null) {
             depthTexture = depthAttachment.textureView();
             MetalGpuTexture metalDepth = requireTextureView(depthTexture, "Depth attachment");
-            OptionalDouble attachmentClear = depthAttachment.clearValue();
-            depthClear = attachmentClear.isPresent() ? attachmentClear.getAsDouble() : null;
-
-            Double pendingDepth = pendingDepthClears.get(metalDepth);
-            if (pendingDepth != null && depthClear == null) {
-                if (isFullTextureView(depthTexture)) {
-                    pendingDepthClears.remove(metalDepth);
-                    depthClear = pendingDepth;
-                } else {
-                    flushPendingClear(metalDepth);
-                }
-            } else {
-                pendingDepthClears.remove(metalDepth);
+            if (!renderArea.fillsTexture(depthTexture) || depthTexture.baseMipLevel() != 0
+                    || metalDepth.getMipLevels() != 1 || metalDepth.getDepthOrLayers() != 1) {
+                flushPendingClear(metalDepth);
             }
+            Double pendingDepth = pendingDepthClears.remove(metalDepth);
+            OptionalDouble attachmentClear = depthAttachment.clearValue();
+            depthClear = attachmentClear.isPresent() ? Double.valueOf(attachmentClear.getAsDouble()) : pendingDepth;
             metalDepth.markContentsDirty();
         }
 
-        assert descriptor.renderArea != null;
-        RenderPass.RenderArea renderArea = descriptor.renderArea;
         MetalRenderPass renderPass = new MetalRenderPass(
                 device,
                 this,
                 descriptor.label(),
-                colorTexture,
+                colorTextures,
                 depthTexture,
                 renderArea,
-                colorClear,
+                colorClears,
                 depthClear
         );
         currentRenderPass = renderPass;
@@ -371,25 +420,29 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             final int regionX,
             final int regionY,
             final int regionWidth,
-            final int regionHeight
+            final int regionHeight,
+            final int mipLevel
     ) {
         MetalGpuTexture color = requireTexture(colorTexture, "Color clear texture");
         MetalGpuTexture depth = requireTexture(depthTexture, "Depth clear texture");
         Vector4fc clearColorCopy = new Vector4f(clearColor);
-        BufferCopySupport.requireRange(regionX, regionWidth, color.getWidth(0), "Color clear X region");
-        BufferCopySupport.requireRange(regionY, regionHeight, color.getHeight(0), "Color clear Y region");
-        BufferCopySupport.requireRange(regionX, regionWidth, depth.getWidth(0), "Depth clear X region");
-        BufferCopySupport.requireRange(regionY, regionHeight, depth.getHeight(0), "Depth clear Y region");
+        BufferCopySupport.requireRange(mipLevel, 1L, color.getMipLevels(), "Color clear mip level");
+        BufferCopySupport.requireRange(mipLevel, 1L, depth.getMipLevels(), "Depth clear mip level");
+        BufferCopySupport.requireRange(regionX, regionWidth, color.getWidth(mipLevel), "Color clear X region");
+        BufferCopySupport.requireRange(regionY, regionHeight, color.getHeight(mipLevel), "Color clear Y region");
+        BufferCopySupport.requireRange(regionX, regionWidth, depth.getWidth(mipLevel), "Depth clear X region");
+        BufferCopySupport.requireRange(regionY, regionHeight, depth.getHeight(mipLevel), "Depth clear Y region");
         if (regionWidth == 0 || regionHeight == 0) {
             return;
         }
-        if (isFullTextureRegion(color, depth, regionX, regionY, regionWidth, regionHeight)) {
+        if (mipLevel == 0 && color.getMipLevels() == 1 && depth.getMipLevels() == 1
+                && isFullTextureRegion(color, depth, regionX, regionY, regionWidth, regionHeight)) {
             pendingColorClears.put(color, clearColorCopy);
             pendingDepthClears.put(depth, clearDepth);
             return;
         }
-        color.markContentsDirty();
-        depth.markContentsDirty();
+        flushPendingClearForWrite(color);
+        flushPendingClearForWrite(depth);
         submitRenderPass();
         endEncoder();
         commandBuffer().clearColorDepthTexturesRegion(
@@ -401,15 +454,16 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
                 regionY,
                 regionWidth,
                 regionHeight,
+                mipLevel,
                 trackerEnabled() ? null : fence,
                 trackerEnabled() ? encoder -> beginExternalRenderEncoder(
                         encoder,
                         () -> {
                             textureAccess(
-                                    color, 0, 1, 0, 1,
+                                    color, mipLevel, 1, 0, 1,
                                     ResourceAccessTracker.Access.WRITE, STAGE_FRAGMENT);
                             textureAccess(
-                                    depth, 0, 1, 0, 1,
+                                    depth, mipLevel, 1, 0, 1,
                                     ResourceAccessTracker.Access.WRITE, STAGE_FRAGMENT);
                         }) : null,
                 trackerEnabled() ? this::finishExternalRenderEncoder : null
@@ -830,9 +884,6 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             this.currentSubmissionHasEncoder = true;
         }
         this.activeEncoderId = this.accessTracker.beginEncoder();
-        this.activeDependencyFence = encoder.isMetal4()
-                ? null
-                : dependencyFence(this.activeEncoderId);
     }
 
     private void applyDependency(final ResourceAccessTracker.Dependency dependency) {
@@ -841,7 +892,7 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             throw new IllegalStateException("Resource access declared without an active Metal encoder");
         }
 
-        if (dependency.hasSameEncoderDependency() && encoder.isMetal4()) {
+        if (dependency.hasSameEncoderDependency()) {
             encoder.barrierAfterEncoderStages(
                     dependency.sameEncoderStages(),
                     dependency.consumerStages(),
@@ -849,46 +900,14 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             );
             Stats.increment(Stats.Counter.BARRIERS);
         }
-        if (!dependency.hasPriorDependency()) {
-            return;
-        }
-        if (encoder.isMetal4()) {
+        if (dependency.hasPriorDependency()) {
             encoder.barrierAfterQueueStages(
                     dependency.priorStages(),
                     dependency.consumerStages(),
                     dependency.deviceVisibility()
             );
             Stats.increment(Stats.Counter.BARRIERS);
-            return;
         }
-
-        for (int index = 0; index < dependency.producerCount(); index++) {
-            MTLFence producerFence = dependencyFence(dependency.producerEncoder(index));
-            if (encoder instanceof MTLRenderCommandEncoder renderEncoder) {
-                renderEncoder.waitForFence(producerFence, renderStages(dependency.consumerStages()));
-            } else if (encoder instanceof MTLBlitCommandEncoder blitEncoder) {
-                blitEncoder.waitForFence(producerFence);
-            }
-            Stats.increment(Stats.Counter.FENCE_WAITS);
-        }
-    }
-
-    private MTLFence dependencyFence(final long encoderId) {
-        int index = Math.toIntExact(encoderId);
-        int slot = Math.floorMod(this.currentSubmitIndex, MAX_SUBMITS_IN_FLIGHT);
-        List<MTLFence> fences = this.dependencyFences[slot];
-        while (fences.size() <= index) {
-            fences.add(this.device.metalDevice().newFence());
-            Stats.increment(Stats.Counter.NATIVE_RESOURCES_CREATED);
-        }
-        return fences.get(index);
-    }
-
-    private MTLFence requireActiveDependencyFence() {
-        if (this.activeDependencyFence == null) {
-            throw new IllegalStateException("Metal 3 encoder has no resource dependency fence");
-        }
-        return this.activeDependencyFence;
     }
 
     private void beginExternalRenderEncoder(
@@ -911,7 +930,6 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
             } finally {
                 this.currentEncoder = null;
                 this.activeEncoderId = -1L;
-                this.activeDependencyFence = null;
             }
             throw failure;
         }
@@ -926,67 +944,26 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         } finally {
             this.currentEncoder = null;
             this.activeEncoderId = -1L;
-            this.activeDependencyFence = null;
         }
     }
 
     private void finishTrackedRenderEncoder(final MTLRenderCommandEncoder encoder) {
-        long stages = this.accessTracker.stagesForEncoder(this.activeEncoderId);
-        if (stages == 0L) {
-            return;
-        }
-        this.currentSubmissionStages |= stages;
-        if (!encoder.isMetal4()) {
-            MTLFence dependencyFence = requireActiveDependencyFence();
-            encoder.updateFence(dependencyFence, renderStages(stages));
-            this.currentSubmissionLastFence = dependencyFence;
-            Stats.increment(Stats.Counter.FENCE_UPDATES);
-        }
+        this.currentSubmissionStages |= this.accessTracker.stagesForEncoder(this.activeEncoderId);
     }
 
     private void finishTrackedBlitEncoder(final MTLBlitCommandEncoder encoder) {
-        long stages = this.accessTracker.stagesForEncoder(this.activeEncoderId);
-        if (stages == 0L) {
-            return;
-        }
-        this.currentSubmissionStages |= stages;
-        if (!encoder.isMetal4()) {
-            MTLFence dependencyFence = requireActiveDependencyFence();
-            encoder.updateFence(dependencyFence);
-            this.currentSubmissionLastFence = dependencyFence;
-            Stats.increment(Stats.Counter.FENCE_UPDATES);
-        }
+        this.currentSubmissionStages |= this.accessTracker.stagesForEncoder(this.activeEncoderId);
     }
 
     private void waitForPreviousSubmission(final MTLCommandEncoder encoder) {
-        if (encoder.isMetal4()) {
-            if (this.previousSubmissionStages != 0L) {
-                long consumerStages = encoder instanceof MTLRenderCommandEncoder
-                        ? STAGE_VERTEX | STAGE_FRAGMENT
-                        : STAGE_BLIT;
-                encoder.barrierAfterQueueStages(
-                        this.previousSubmissionStages,
-                        consumerStages,
-                        true
-                );
-                Stats.increment(Stats.Counter.BARRIERS);
-            }
+        if (this.previousSubmissionStages == 0L) {
             return;
         }
-        if (this.previousSubmissionFence == null) {
-            return;
-        }
-        if (encoder instanceof MTLRenderCommandEncoder renderEncoder) {
-            renderEncoder.waitForFence(
-                    this.previousSubmissionFence,
-                    MTLRenderStages.VertexAndFragment
-            );
-        } else if (encoder instanceof MTLBlitCommandEncoder blitEncoder) {
-            blitEncoder.waitForFence(this.previousSubmissionFence);
-        } else {
-            throw new IllegalStateException("Unsupported Metal encoder at submission boundary");
-        }
-        Stats.increment(Stats.Counter.FENCE_WAITS);
+        long consumerStages = encoder instanceof MTLRenderCommandEncoder
+                ? STAGE_VERTEX | STAGE_FRAGMENT
+                : STAGE_BLIT;
+        encoder.barrierAfterQueueStages(this.previousSubmissionStages, consumerStages, true);
+        Stats.increment(Stats.Counter.BARRIERS);
     }
 
     private void finishTrackedSubmission() {
@@ -995,12 +972,8 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         }
         if (this.currentSubmissionStages != 0L) {
             this.previousSubmissionStages = this.currentSubmissionStages;
-            if (this.currentSubmissionLastFence != null) {
-                this.previousSubmissionFence = this.currentSubmissionLastFence;
-            }
         }
         this.currentSubmissionStages = 0L;
-        this.currentSubmissionLastFence = null;
         this.currentSubmissionHasEncoder = false;
     }
 
@@ -1027,20 +1000,7 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         int slot = (int) (submitIndex % MAX_SUBMITS_IN_FLIGHT);
         InFlight f = inFlight[slot];
         if (f != null && f.index == submitIndex) {
-            if (f.buffer.isMetal4()) {
-                return f.buffer.waitUntilCompleted(timeoutMs);
-            }
-            Semaphore semaphore = submitSemaphores[slot];
-            try {
-                if (!semaphore.tryAcquire(Math.max(timeoutMs, 0L), TimeUnit.MILLISECONDS)) {
-                    return false;
-                }
-                semaphore.release();
-                return true;
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IllegalStateException("Render thread interrupted while waiting for Metal submit completion", e);
-            }
+            return f.buffer.waitUntilCompleted(timeoutMs);
         }
         return true;
     }
@@ -1061,12 +1021,6 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         }
         transientMemory.close();
         device.queueResourceRelease(fence.handle());
-        for (List<MTLFence> fences : this.dependencyFences) {
-            for (MTLFence dependencyFence : fences) {
-                device.queueResourceRelease(dependencyFence.handle());
-            }
-            fences.clear();
-        }
         destroyQueue.close();
         for (ArrayDeque<MTLBuffer> bucket : dynamicBackingPool.values()) {
             for (MTLBuffer buffer : bucket) {
@@ -1171,13 +1125,6 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
     void discardPendingClears(final MetalGpuTexture texture) {
         this.pendingColorClears.remove(texture);
         this.pendingDepthClears.remove(texture);
-    }
-
-    private static boolean isFullTextureView(final GpuTextureView textureView) {
-        return textureView.baseMipLevel() == 0
-                && textureView.texture().getMipLevels() == 1
-                && textureView.mipLevels() >= 1
-                && textureView.texture().getDepthOrLayers() == 1;
     }
 
     private MetalGpuBuffer requireBuffer(final GpuBuffer buffer, final String operation) {

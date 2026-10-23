@@ -19,7 +19,6 @@ public final class MTLRenderPassDescriptor implements AutoCloseable {
     public static final long STORE_ACTION_DONT_CARE = 0L;
     public static final long STORE_ACTION_STORE = 1L;
 
-    private static final MemorySegment CLS = ObjC.clazz("MTLRenderPassDescriptor");
     private static final MemorySegment MTL4_CLS = ObjC.findClass("MTL4RenderPassDescriptor");
     private static final Msg NEW = Msg.of("new", ADDRESS);
     private static final Msg COLOR_ATTACHMENTS = Msg.of("colorAttachments", ADDRESS);
@@ -38,15 +37,10 @@ public final class MTLRenderPassDescriptor implements AutoCloseable {
     private boolean closed;
 
     public MTLRenderPassDescriptor() {
-        this(false);
-    }
-
-    public MTLRenderPassDescriptor(final boolean metal4) {
-        MemorySegment descriptorClass = metal4 ? MTL4_CLS : CLS;
-        if (ObjC.isNil(descriptorClass)) {
+        if (ObjC.isNil(MTL4_CLS)) {
             throw new IllegalStateException("MTL4RenderPassDescriptor is unavailable");
         }
-        this.handle = NEW.sendPtr(descriptorClass);
+        this.handle = NEW.sendPtr(MTL4_CLS);
         if (ObjC.isNil(this.handle)) {
             throw new IllegalStateException("Failed to create render pass descriptor");
         }

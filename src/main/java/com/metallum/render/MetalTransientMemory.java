@@ -1,11 +1,11 @@
 package com.metallum.render;
 
-import com.mojang.blaze3d.buffers.GpuBuffer;
-import com.mojang.blaze3d.buffers.GpuBuffer.Usage;
-import com.mojang.blaze3d.buffers.GpuBufferSlice;
-import com.mojang.blaze3d.buffers.GpuBufferSlice.MappedView;
-import com.mojang.blaze3d.systems.TransientMemory;
-import com.mojang.blaze3d.util.TransientBlockAllocator;
+import com.mojang.renderpearl.api.buffers.GpuBuffer;
+import com.mojang.renderpearl.api.buffers.GpuBuffer.Usage;
+import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
+import com.mojang.renderpearl.api.buffers.GpuBufferSlice.MappedView;
+import com.mojang.renderpearl.api.buffers.TransientMemory;
+import com.mojang.renderpearl.backend.util.TransientBlockAllocator;
 import it.unimi.dsi.fastutil.objects.ReferenceArrayList;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
@@ -24,8 +24,8 @@ final class MetalTransientMemory implements TransientMemory {
     private final MetalDevice device;
     private final MetalCommandEncoder encoder;
     private final TransientBlockSizingPolicy sizingPolicy = new TransientBlockSizingPolicy();
-    private TransientBlockAllocator<Long> cpuBlockAllocator;
-    private TransientBlockAllocator<MetalGpuBuffer> gpuBlockAllocator;
+    private TransientBlockAllocator<TransientBlockAllocator.Allocator.CpuBlock> cpuBlockAllocator;
+    private TransientBlockAllocator<GpuBlock> gpuBlockAllocator;
     private long blockSize;
     private long submitIndex = 0L;
     private long frameAllocatedBytes;
@@ -64,23 +64,30 @@ final class MetalTransientMemory implements TransientMemory {
         gpuBlockAllocator.close();
     }
 
-    private MetalGpuBuffer allocateGpuBlock(final long size) {
-        return (MetalGpuBuffer) device.createBuffer(null, BLOCK_USAGE, size);
+    private GpuBlock allocateGpuBlock(final long size) {
+        return new GpuBlock((MetalGpuBuffer) device.createBuffer(null, BLOCK_USAGE, size));
     }
 
-    private void freeGpuBlock(final MetalGpuBuffer block) {
-        block.close();
+    private void freeGpuBlock(final GpuBlock block) {
+        block.buffer().close();
     }
 
-    private static TransientBlockAllocator<Long> createCpuAllocator(final long blockSize) {
+    private record GpuBlock(MetalGpuBuffer buffer) implements TransientBlockAllocator.Allocator.Block {
+        @Override
+        public boolean suboptimal() {
+            return false;
+        }
+    }
+
+    private static TransientBlockAllocator<TransientBlockAllocator.Allocator.CpuBlock> createCpuAllocator(final long blockSize) {
         return new TransientBlockAllocator<>(
                 blockSize,
                 MAX_CPU_ALIGNMENT,
-                TransientBlockAllocator.Allocator.create(MemoryUtil::nmemAlloc, MemoryUtil::nmemFree)
+                TransientBlockAllocator.Allocator.CpuBlock.memalloc()
         );
     }
 
-    private TransientBlockAllocator<MetalGpuBuffer> createGpuAllocator(final long blockSize) {
+    private TransientBlockAllocator<GpuBlock> createGpuAllocator(final long blockSize) {
         return new TransientBlockAllocator<>(
                 blockSize,
                 MAX_GPU_ALIGNMENT,
@@ -89,8 +96,8 @@ final class MetalTransientMemory implements TransientMemory {
     }
 
     private void resizeAllocators(final long nextBlockSize, final Runnable releaseGpu) {
-        TransientBlockAllocator<Long> retiredCpu = this.cpuBlockAllocator;
-        TransientBlockAllocator<MetalGpuBuffer> retiredGpu = this.gpuBlockAllocator;
+        TransientBlockAllocator<TransientBlockAllocator.Allocator.CpuBlock> retiredCpu = this.cpuBlockAllocator;
+        TransientBlockAllocator<GpuBlock> retiredGpu = this.gpuBlockAllocator;
         retiredCpu.close();
         this.blockSize = nextBlockSize;
         this.cpuBlockAllocator = createCpuAllocator(nextBlockSize);
@@ -105,8 +112,8 @@ final class MetalTransientMemory implements TransientMemory {
     public @NonNull ByteBuffer allocateCpu(final long size, final long alignment, final long minimumAllocation, final long elementSize) {
         validateAllocation(size, alignment, minimumAllocation, elementSize, MAX_CPU_ALIGNMENT, true);
         recordAllocation(size);
-        TransientBlockAllocator.Allocation<Long> alloc = cpuBlockAllocator.allocate(size, alignment, minimumAllocation, elementSize);
-        return MemoryUtil.memByteBuffer(alloc.block() + alloc.offset(), Math.toIntExact(alloc.size()));
+        TransientBlockAllocator.Allocation<TransientBlockAllocator.Allocator.CpuBlock> alloc = cpuBlockAllocator.allocate(size, alignment, minimumAllocation, elementSize);
+        return MemoryUtil.memByteBuffer(alloc.block().address() + alloc.offset(), Math.toIntExact(alloc.size()));
     }
 
     @Override
@@ -118,8 +125,8 @@ final class MetalTransientMemory implements TransientMemory {
     public @NonNull GpuBufferSlice allocateGpu(final long size, final long alignment, @Usage final int usage, final long minimumAllocation, final long elementSize) {
         validateAllocation(size, alignment, minimumAllocation, elementSize, MAX_GPU_ALIGNMENT, false);
         recordAllocation(size);
-        TransientBlockAllocator.Allocation<MetalGpuBuffer> alloc = gpuBlockAllocator.allocate(size, alignment, minimumAllocation, elementSize);
-        return new GpuBufferSlice(wrap(alloc.block(), usage), alloc.offset(), alloc.size());
+        TransientBlockAllocator.Allocation<GpuBlock> alloc = gpuBlockAllocator.allocate(size, alignment, minimumAllocation, elementSize);
+        return new GpuBufferSlice(wrap(alloc.block().buffer(), usage), alloc.offset(), alloc.size());
     }
 
     @Override
@@ -130,9 +137,9 @@ final class MetalTransientMemory implements TransientMemory {
     private MappedView allocateMapped(final long size, final long alignment, @Usage final int usage, final long minimumAllocation, final long elementSize) {
         validateAllocation(size, alignment, minimumAllocation, elementSize, MAX_GPU_ALIGNMENT, false);
         recordAllocation(size);
-        TransientBlockAllocator.Allocation<MetalGpuBuffer> alloc = gpuBlockAllocator.allocate(size, alignment, minimumAllocation, elementSize);
-        GpuBufferSlice slice = new GpuBufferSlice(wrap(alloc.block(), usage), alloc.offset(), alloc.size());
-        ByteBuffer hostView = alloc.block().sliceStorage(alloc.offset(), alloc.size());
+        TransientBlockAllocator.Allocation<GpuBlock> alloc = gpuBlockAllocator.allocate(size, alignment, minimumAllocation, elementSize);
+        GpuBufferSlice slice = new GpuBufferSlice(wrap(alloc.block().buffer(), usage), alloc.offset(), alloc.size());
+        ByteBuffer hostView = alloc.block().buffer().sliceStorage(alloc.offset(), alloc.size());
         return new MappedView(slice, hostView, () -> {
         });
     }

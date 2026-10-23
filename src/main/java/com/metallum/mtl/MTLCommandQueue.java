@@ -1,6 +1,5 @@
 package com.metallum.mtl;
 
-import com.metallum.Metallum;
 import com.metallum.objc.AutoreleasePool;
 import com.metallum.objc.Msg;
 import com.metallum.objc.ObjC;
@@ -21,9 +20,6 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
 public final class MTLCommandQueue implements AutoCloseable {
     private static final int MAX_SUBMITS_IN_FLIGHT = 3;
 
-    private static final Msg COMMAND_BUFFER = Msg.of("commandBuffer", ADDRESS);
-    private static final Msg COMMAND_BUFFER_WITH_UNRETAINED_REFERENCES =
-            Msg.of("commandBufferWithUnretainedReferences", ADDRESS);
     private static final Msg SET_LABEL = Msg.ofVoid("setLabel:", ADDRESS);
     private static final Msg ADD_RESIDENCY_SET = Msg.ofVoid("addResidencySet:", ADDRESS);
     private static final Msg REMOVE_RESIDENCY_SET = Msg.ofVoid("removeResidencySet:", ADDRESS);
@@ -48,64 +44,51 @@ public final class MTLCommandQueue implements AutoCloseable {
     private static volatile boolean debugLabelsEnabled;
 
     private final MTLDevice device;
-    private final boolean metal4;
-    @Nullable
     private final Metal4SubmissionSlot[] submissionSlots;
     @Nullable
     private MTLResidencySet residencySet;
     private MemorySegment handle;
-    private boolean useUnretainedCommandBuffers;
     private int nextSubmissionSlot;
 
     private MTLCommandQueue(
             final MTLDevice device,
             final MemorySegment handle,
-            final boolean metal4,
-            @Nullable final Metal4SubmissionSlot[] submissionSlots
+            final Metal4SubmissionSlot[] submissionSlots
     ) {
         this.device = device;
         this.handle = handle;
-        this.metal4 = metal4;
         this.submissionSlots = submissionSlots;
     }
 
-    static MTLCommandQueue legacy(final MTLDevice device, final MemorySegment handle) {
-        return new MTLCommandQueue(device, handle, false, null);
-    }
-
-    @Nullable
-    static MTLCommandQueue tryCreateMetal4(final MTLDevice device) {
+    static MTLCommandQueue create(final MTLDevice device) {
         if (ObjC.isNil(COMMIT_OPTIONS_CLASS)
+                || !ObjC.respondsToSelector(device.handle(), "newMTL4CommandQueue")
                 || !ObjC.respondsToSelector(device.handle(), "newCommandAllocator")
                 || !ObjC.respondsToSelector(device.handle(), "newCommandBuffer")) {
-            return null;
+            throw new IllegalStateException("Metal 4 command queues are unavailable on this system");
         }
 
         MemorySegment queue = MemorySegment.NULL;
-        Metal4SubmissionSlot[] slots = null;
+        Metal4SubmissionSlot[] slots = new Metal4SubmissionSlot[MAX_SUBMITS_IN_FLIGHT];
         try {
             queue = NEW_MTL4_COMMAND_QUEUE.sendPtr(device.handle());
             if (ObjC.isNil(queue)) {
-                return null;
+                throw new IllegalStateException("Failed to create MTL4CommandQueue");
             }
-            slots = new Metal4SubmissionSlot[MAX_SUBMITS_IN_FLIGHT];
             for (int i = 0; i < slots.length; i++) {
                 slots[i] = Metal4SubmissionSlot.create(device, i);
             }
-            return new MTLCommandQueue(device, queue, true, slots);
+            return new MTLCommandQueue(device, queue, slots);
         } catch (RuntimeException exception) {
-            Metallum.LOGGER.warn("[metallum] Failed to initialize the Metal 4 command path; falling back to Metal 3", exception);
-            if (slots != null) {
-                for (Metal4SubmissionSlot slot : slots) {
-                    if (slot != null) {
-                        slot.close();
-                    }
+            for (Metal4SubmissionSlot slot : slots) {
+                if (slot != null) {
+                    slot.close();
                 }
             }
             if (!ObjC.isNil(queue)) {
                 ObjC.release(queue);
             }
-            return null;
+            throw exception;
         }
     }
 
@@ -117,32 +100,8 @@ public final class MTLCommandQueue implements AutoCloseable {
         return debugLabelsEnabled;
     }
 
-    public boolean isMetal4() {
-        return this.metal4;
-    }
-
     public MTLCommandBuffer makeCommandBuffer(@Nullable final String label) {
-        if (this.metal4) {
-            return makeMetal4CommandBuffer(label);
-        }
-        try (AutoreleasePool _ = AutoreleasePool.push()) {
-            MemorySegment commandBuffer = this.useUnretainedCommandBuffers
-                    ? COMMAND_BUFFER_WITH_UNRETAINED_REFERENCES.sendPtr(this.handle)
-                    : COMMAND_BUFFER.sendPtr(this.handle);
-            if (ObjC.isNil(commandBuffer)) {
-                throw new IllegalStateException("Failed to create MTLCommandBuffer");
-            }
-            commandBuffer = ObjC.retain(commandBuffer);
-            setLabel(commandBuffer, label);
-            return MTLCommandBuffer.metal3(commandBuffer);
-        }
-    }
-
-    private MTLCommandBuffer makeMetal4CommandBuffer(@Nullable final String label) {
         Metal4SubmissionSlot[] slots = this.submissionSlots;
-        if (slots == null) {
-            throw new IllegalStateException("Metal 4 command queue is incomplete");
-        }
         Metal4SubmissionSlot slot = slots[this.nextSubmissionSlot];
         this.nextSubmissionSlot = (this.nextSubmissionSlot + 1) % slots.length;
         slot.prepare();
@@ -154,7 +113,7 @@ public final class MTLCommandQueue implements AutoCloseable {
         try {
             BEGIN_MTL4_COMMAND_BUFFER.send(commandBuffer, slot.allocator);
             setLabel(commandBuffer, label);
-            return MTLCommandBuffer.metal4(
+            return new MTLCommandBuffer(
                     commandBuffer,
                     this,
                     slot,
@@ -187,7 +146,16 @@ public final class MTLCommandQueue implements AutoCloseable {
             try (Arena arena = Arena.ofConfined()) {
                 MemorySegment commandBuffers = arena.allocate(ADDRESS);
                 commandBuffers.set(ADDRESS, 0L, commandBuffer.handle());
-                COMMIT_MTL4.send(this.handle, commandBuffers, 1L, slot.commitOptions);
+                MemorySegment options = NEW.sendPtr(COMMIT_OPTIONS_CLASS);
+                if (ObjC.isNil(options)) {
+                    throw new IllegalStateException("Failed to create MTL4CommitOptions");
+                }
+                try {
+                    ADD_FEEDBACK_HANDLER.send(options, slot.feedbackHandler);
+                    COMMIT_MTL4.send(this.handle, commandBuffers, 1L, options);
+                } finally {
+                    ObjC.release(options);
+                }
             }
         } catch (RuntimeException exception) {
             slot.failSubmission("Metal 4 queue commit failed: " + exception.getMessage());
@@ -200,15 +168,7 @@ public final class MTLCommandQueue implements AutoCloseable {
     }
 
     void waitForDrawable(final CAMetalDrawable drawable) {
-        if (this.metal4) {
-            WAIT_FOR_DRAWABLE.send(this.handle, drawable.handle());
-        }
-    }
-
-    public void useUnretainedCommandBuffers(final boolean enabled) {
-        if (!this.metal4) {
-            this.useUnretainedCommandBuffers = enabled;
-        }
+        WAIT_FOR_DRAWABLE.send(this.handle, drawable.handle());
     }
 
     public void addResidencySet(final MTLResidencySet residencySet) {
@@ -229,10 +189,8 @@ public final class MTLCommandQueue implements AutoCloseable {
         if (ObjC.isNil(this.handle)) {
             return;
         }
-        if (this.submissionSlots != null) {
-            for (Metal4SubmissionSlot slot : this.submissionSlots) {
-                slot.close();
-            }
+        for (Metal4SubmissionSlot slot : this.submissionSlots) {
+            slot.close();
         }
         ObjC.release(this.handle);
         this.handle = MemorySegment.NULL;
@@ -241,19 +199,19 @@ public final class MTLCommandQueue implements AutoCloseable {
     static final class Metal4SubmissionSlot implements AutoCloseable {
         private final Semaphore completion = new Semaphore(0);
         private final MemorySegment allocator;
-        private final MemorySegment commitOptions;
         private final MTL4ArgumentTable argumentTable;
+        // One block per slot, registered on fresh commit options for every commit: on macOS 27
+        // a feedback handler attached to reused MTL4CommitOptions only fires for its first commit.
+        private MemorySegment feedbackHandler = MemorySegment.NULL;
         @Nullable
         private volatile MTLCommandBuffer activeCommandBuffer;
         private volatile boolean submitted;
 
         private Metal4SubmissionSlot(
                 final MemorySegment allocator,
-                final MemorySegment commitOptions,
                 final MTL4ArgumentTable argumentTable
         ) {
             this.allocator = allocator;
-            this.commitOptions = commitOptions;
             this.argumentTable = argumentTable;
         }
 
@@ -262,11 +220,6 @@ public final class MTLCommandQueue implements AutoCloseable {
             if (ObjC.isNil(allocator)) {
                 throw new IllegalStateException("Failed to create MTL4CommandAllocator " + index);
             }
-            MemorySegment options = NEW.sendPtr(COMMIT_OPTIONS_CLASS);
-            if (ObjC.isNil(options)) {
-                ObjC.release(allocator);
-                throw new IllegalStateException("Failed to create MTL4CommitOptions " + index);
-            }
             MTL4ArgumentTable table;
             try {
                 table = MTL4ArgumentTable.create(
@@ -274,14 +227,12 @@ public final class MTLCommandQueue implements AutoCloseable {
                         debugLabelsEnabled ? "Metallum argument table " + index : null
                 );
             } catch (RuntimeException exception) {
-                ObjC.release(options);
                 ObjC.release(allocator);
                 throw exception;
             }
-            Metal4SubmissionSlot slot = new Metal4SubmissionSlot(allocator, options, table);
+            Metal4SubmissionSlot slot = new Metal4SubmissionSlot(allocator, table);
             try {
-                MemorySegment handler = ObjCBlock.withConsumer(slot::complete);
-                ADD_FEEDBACK_HANDLER.send(options, handler);
+                slot.feedbackHandler = ObjCBlock.withConsumer(slot::complete);
                 return slot;
             } catch (RuntimeException exception) {
                 slot.close();
@@ -354,7 +305,6 @@ public final class MTLCommandQueue implements AutoCloseable {
 
         @Override
         public void close() {
-            ObjC.release(this.commitOptions);
             ObjC.release(this.allocator);
             this.argumentTable.close();
         }

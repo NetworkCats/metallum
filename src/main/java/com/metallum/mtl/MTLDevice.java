@@ -25,17 +25,10 @@ public record MTLDevice(MemorySegment handle) {
             ObjC.METAL.findOrThrow("MTLCreateSystemDefaultDevice"), FunctionDescriptor.of(ADDRESS));
 
     private static final Msg NEW_BUFFER = Msg.of("newBufferWithLength:options:", ADDRESS, JAVA_LONG, JAVA_LONG);
-    private static final Msg NEW_COMMAND_QUEUE = Msg.of("newCommandQueue", ADDRESS);
     private static final Msg NEW_TEXTURE = Msg.of("newTextureWithDescriptor:", ADDRESS, ADDRESS);
     private static final Msg NEW_SAMPLER_STATE = Msg.of("newSamplerStateWithDescriptor:", ADDRESS, ADDRESS);
     private static final Msg NEW_DEPTH_STENCIL_STATE = Msg.of("newDepthStencilStateWithDescriptor:", ADDRESS, ADDRESS);
     private static final Msg NEW_FENCE = Msg.of("newFence", ADDRESS);
-    private static final Msg NEW_LIBRARY_WITH_SOURCE = Msg.of("newLibraryWithSource:options:error:", true, ADDRESS, ADDRESS, ADDRESS, ADDRESS);
-    private static final Msg NEW_FUNCTION_WITH_NAME = Msg.of("newFunctionWithName:", true, ADDRESS, ADDRESS);
-    private static final Msg NEW_RENDER_PIPELINE_STATE = Msg.of("newRenderPipelineStateWithDescriptor:error:", true, ADDRESS, ADDRESS, ADDRESS);
-    private static final Msg NEW_RENDER_PIPELINE_STATE_ASYNC = Msg.ofVoid(
-            "newRenderPipelineStateWithDescriptor:completionHandler:", true, ADDRESS, ADDRESS);
-    private static final Msg LOCALIZED_DESCRIPTION = Msg.of("localizedDescription", ADDRESS);
     private static final Msg MINIMUM_TEXTURE_BUFFER_ALIGNMENT =
             Msg.of("minimumTextureBufferAlignmentForPixelFormat:", JAVA_LONG, JAVA_LONG);
     private static final Msg NAME = Msg.of("name", ADDRESS);
@@ -50,6 +43,9 @@ public record MTLDevice(MemorySegment handle) {
             "isDepth24Stencil8PixelFormatSupported",
             java.lang.foreign.ValueLayout.JAVA_BOOLEAN);
 
+    private static final Msg SUPPORTS_FAMILY = Msg.of(
+            "supportsFamily:", java.lang.foreign.ValueLayout.JAVA_BOOLEAN, JAVA_LONG);
+    private static final long MTL_GPU_FAMILY_METAL4 = 5002L;
     private static final String METAL_4_QUEUE_SELECTOR = "newMTL4CommandQueue";
     private static final String CONCURRENT_COMPILATION_SELECTOR = "setShouldMaximizeConcurrentCompilation:";
 
@@ -87,8 +83,10 @@ public record MTLDevice(MemorySegment handle) {
         return ObjC.respondsToSelector(handle, "registryID") ? REGISTRY_ID.sendLong(handle) : 0L;
     }
 
+    /** True when the GPU and OS expose the complete Metal 4 feature set (macOS 26+, Apple silicon). */
     public boolean supportsMetal4() {
-        return ObjC.respondsToSelector(handle, METAL_4_QUEUE_SELECTOR);
+        return ObjC.respondsToSelector(handle, METAL_4_QUEUE_SELECTOR)
+                && SUPPORTS_FAMILY.sendBoolean(handle, MTL_GPU_FAMILY_METAL4);
     }
 
     public boolean enableConcurrentCompilation() {
@@ -121,18 +119,8 @@ public record MTLDevice(MemorySegment handle) {
         return new MTLBuffer(buffer);
     }
 
-    public MTLCommandQueue newCommandQueue(final boolean preferMetal4) {
-        if (preferMetal4) {
-            MTLCommandQueue metal4Queue = MTLCommandQueue.tryCreateMetal4(this);
-            if (metal4Queue != null) {
-                return metal4Queue;
-            }
-        }
-        MemorySegment queue = NEW_COMMAND_QUEUE.sendPtr(handle);
-        if (ObjC.isNil(queue)) {
-            throw new IllegalStateException("newCommandQueue returned nil");
-        }
-        return MTLCommandQueue.legacy(this, queue);
+    public MTLCommandQueue newCommandQueue() {
+        return MTLCommandQueue.create(this);
     }
 
     public MemorySegment newTexture(final MTLTextureDescriptor descriptor) {
@@ -167,101 +155,8 @@ public record MTLDevice(MemorySegment handle) {
         return new MTLFence(fence);
     }
 
-    public MemorySegment newFunction(final String mslSource, final String entryPoint) {
-        MemorySegment library = newLibrary(mslSource);
-        if (ObjC.isNil(library)) {
-            return MemorySegment.NULL;
-        }
-        try {
-            return newFunction(library, entryPoint);
-        } finally {
-            ObjC.release(library);
-        }
-    }
-
-    public MemorySegment newLibrary(final String mslSource) {
-        try (AutoreleasePool _ = AutoreleasePool.push(); Arena arena = Arena.ofConfined()) {
-            MemorySegment errorOut = arena.allocate(ADDRESS);
-            MemorySegment nsSource = ObjC.nsString(mslSource);
-            MemorySegment library;
-            try {
-                library = NEW_LIBRARY_WITH_SOURCE.sendPtr(handle, nsSource, MemorySegment.NULL, errorOut);
-            } finally {
-                ObjC.release(nsSource);
-            }
-            if (ObjC.isNil(library)) {
-                Metallum.LOGGER.error("[metallum] Failed to compile MSL: {}", errorDescription(errorOut));
-                return MemorySegment.NULL;
-            }
-            return library;
-        }
-    }
-
-    public MemorySegment newFunction(final MemorySegment library, final String entryPoint) {
-        try (AutoreleasePool _ = AutoreleasePool.push()) {
-            MemorySegment nsEntry = ObjC.nsString(entryPoint);
-            MemorySegment function;
-            try {
-                function = NEW_FUNCTION_WITH_NAME.sendPtr(library, nsEntry);
-            } finally {
-                ObjC.release(nsEntry);
-            }
-            if (ObjC.isNil(function)) {
-                Metallum.LOGGER.error("[metallum] Failed to resolve MSL entry point '{}'", entryPoint);
-                return MemorySegment.NULL;
-            }
-            return function;
-        }
-    }
-
-    public MemorySegment newRenderPipelineState(final MTLRenderPipelineDescriptor descriptor) {
-        try (AutoreleasePool _ = AutoreleasePool.push(); Arena arena = Arena.ofConfined()) {
-            MemorySegment errorOut = arena.allocate(ADDRESS);
-            MemorySegment pipeline = NEW_RENDER_PIPELINE_STATE.sendPtr(handle, descriptor.handle(), errorOut);
-            if (ObjC.isNil(pipeline)) {
-                Metallum.LOGGER.error("[metallum] Failed to create render pipeline state: {}", errorDescription(errorOut));
-                return MemorySegment.NULL;
-            }
-            return pipeline;
-        }
-    }
-
-    public MemorySegment newRenderPipelineStateAsync(final MTLRenderPipelineDescriptor descriptor) {
-        if (!ObjC.respondsToSelector(handle, "newRenderPipelineStateWithDescriptor:completionHandler:")) {
-            return newRenderPipelineState(descriptor);
-        }
-        CompletableFuture<MemorySegment> completion = new CompletableFuture<>();
-        try (ObjCBlock.CompletionLease lease = ObjCBlock.leaseBiConsumer((pipeline, error) -> {
-            try (AutoreleasePool ignored = AutoreleasePool.push()) {
-                if (!ObjC.isNil(pipeline)) {
-                    completion.complete(ObjC.retain(pipeline));
-                } else {
-                    String message = ObjC.isNil(error)
-                            ? "unknown error"
-                            : ObjC.javaString(LOCALIZED_DESCRIPTION.sendPtr(error));
-                    completion.completeExceptionally(new IllegalStateException(message));
-                }
-            } catch (Throwable throwable) {
-                completion.completeExceptionally(throwable);
-            }
-        })) {
-            NEW_RENDER_PIPELINE_STATE_ASYNC.send(handle, descriptor.handle(), lease.block());
-            try {
-                return completion.join();
-            } catch (CompletionException exception) {
-                Metallum.LOGGER.error("[metallum] Failed to create render pipeline state asynchronously: {}",
-                        exception.getCause() == null ? exception.getMessage() : exception.getCause().getMessage());
-                return MemorySegment.NULL;
-            }
-        }
-    }
-
     static long minimumTextureBufferAlignment(final MemorySegment device, final long pixelFormat) {
         return MINIMUM_TEXTURE_BUFFER_ALIGNMENT.sendLong(device, pixelFormat);
     }
 
-    private static String errorDescription(final MemorySegment errorOut) {
-        MemorySegment error = errorOut.get(ADDRESS, 0L);
-        return ObjC.isNil(error) ? "unknown error" : ObjC.javaString(LOCALIZED_DESCRIPTION.sendPtr(error));
-    }
 }

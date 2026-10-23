@@ -3,7 +3,7 @@ package com.metallum.render;
 import com.metallum.mtl.MTLBlitCommandEncoder;
 import com.metallum.mtl.MTLGpuCounterPool;
 import com.metallum.mtl.MTLRenderCommandEncoder;
-import com.mojang.blaze3d.systems.GpuQueryPool;
+import com.mojang.renderpearl.api.commands.GpuQueryPool;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import org.jspecify.annotations.NonNull;
@@ -30,7 +30,7 @@ final class MetalGpuQueryPool implements GpuQueryPool {
         this.written = new long[Math.toIntExact(((long) size + Long.SIZE - 1L) / Long.SIZE)];
         this.resolved = new long[this.written.length];
         this.nativePool = MTLGpuCounterPool.create(
-                device.metalDevice(), size, device.usesMetal4CommandPath());
+                device.metalDevice(), size);
     }
 
     void write(final MTLRenderCommandEncoder encoder, final int index) {

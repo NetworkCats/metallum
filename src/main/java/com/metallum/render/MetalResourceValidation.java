@@ -1,7 +1,7 @@
 package com.metallum.render;
 
-import com.mojang.blaze3d.buffers.GpuBuffer;
-import com.mojang.blaze3d.textures.GpuTexture;
+import com.mojang.renderpearl.api.buffers.GpuBuffer;
+import com.mojang.renderpearl.api.textures.GpuTexture;
 
 /** Backend-specific limits which the Blaze3D resource base classes do not validate. */
 final class MetalResourceValidation {

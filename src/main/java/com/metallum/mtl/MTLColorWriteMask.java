@@ -1,6 +1,6 @@
 package com.metallum.mtl;
 
-import com.mojang.blaze3d.pipeline.ColorTargetState;
+import com.mojang.renderpearl.api.pipeline.ColorTargetState;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 
